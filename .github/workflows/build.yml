@@ -26,6 +26,7 @@ jobs:
       - name: Build exe with PyInstaller
         run: |
           python -m PyInstaller --clean --noconfirm --onefile --windowed --name "TA Invoices and Estimates" --hidden-import pypdf --add-data "logo_grayblue_transparent.png;." adael_desktop.py
+        working-directory: ${{ github.workspace }}
 
       - name: Upload release
         uses: softprops/action-gh-release@v2
