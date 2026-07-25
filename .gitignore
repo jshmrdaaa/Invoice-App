@@ -1,0 +1,18 @@
+# Customer data - stays only on the laptop it's created on, never pushed
+customers.json
+drafts.json
+invoice_history.json
+estimate_history.json
+invoice_counter.txt
+estimate_counter.txt
+past_invoice_counter.txt
+
+# Build output
+build/
+dist/
+*.spec
+*.exe
+
+# OS junk
+.DS_Store
+Thumbs.db
