@@ -67,7 +67,7 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.1"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -120,6 +120,65 @@ def write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as file:
         json.dump(data, file, indent=4)
+
+
+def backup_file_list():
+    return [
+        DRAFTS_FILE,
+        CUSTOMERS_FILE,
+        INVOICE_HISTORY_FILE,
+        ESTIMATE_HISTORY_FILE,
+        SETTINGS_FILE,
+        INVOICE_COUNTER_FILE,
+        ESTIMATE_COUNTER_FILE,
+        PAST_INVOICE_COUNTER_FILE,
+        WRITABLE_LOGO_PATH,
+    ]
+
+
+def write_backup_zip(backup_path):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as backup:
+        for path in backup_file_list():
+            if os.path.exists(path):
+                backup.write(path, os.path.basename(path))
+        for folder in ["invoices", "estimates"]:
+            folder_path = os.path.join(APP_DIR, folder)
+            if os.path.exists(folder_path):
+                for filename in os.listdir(folder_path):
+                    full_path = os.path.join(folder_path, filename)
+                    if os.path.isfile(full_path):
+                        backup.write(full_path, os.path.join(folder, filename))
+
+
+def prune_old_auto_backups(keep=30):
+    if not os.path.exists(BACKUP_DIR):
+        return
+    autos = sorted(
+        filename for filename in os.listdir(BACKUP_DIR)
+        if filename.startswith("adael_autobackup_") and filename.endswith(".zip")
+    )
+    for filename in autos[:-keep]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, filename))
+        except OSError:
+            pass
+
+
+def auto_backup_if_needed():
+    """Silently makes one dated backup per day the app is opened, and prunes
+    old ones so the backups folder doesn't grow forever. Never raises - a
+    backup problem should never stop the app from opening normally."""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        today_stamp = datetime.today().strftime("%Y%m%d")
+        backup_path = os.path.join(BACKUP_DIR, f"adael_autobackup_{today_stamp}.zip")
+        if os.path.exists(backup_path):
+            return
+        write_backup_zip(backup_path)
+        prune_old_auto_backups()
+    except Exception:
+        pass
 
 
 def get_settings():
@@ -204,8 +263,40 @@ def money(value):
     return f"${clean_float(value):,.2f}"
 
 
+def format_qty(value):
+    value = clean_float(value)
+    if value == int(value):
+        return str(int(value))
+    return f"{value:g}"
+
+
+def resolve_discount(discount_text, subtotal):
+    """The Discount box accepts either a flat dollar amount ("50") or a
+    percentage ("10%") - this figures out which one was typed and returns
+    the actual dollar amount to subtract, so nobody has to do the math."""
+    text = str(discount_text or "").strip()
+    if not text:
+        return 0.0
+    if text.endswith("%"):
+        percent = clean_float(text[:-1])
+        return round(clean_float(subtotal) * percent / 100, 2)
+    return round(clean_float(text), 2)
+
+
 def today_text():
     return datetime.today().strftime("%Y/%m/%d")
+
+
+def friendly_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for fmt in ("%Y/%m/%d", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%b %d, %Y")
+        except ValueError:
+            continue
+    return text
 
 
 def image_to_data_uri(path):
@@ -236,8 +327,12 @@ def pdfkit_config():
 
 
 def payment_status(total, amount_paid):
-    total = clean_float(total)
-    paid = clean_float(amount_paid)
+    # Round to the cent before comparing - summing several partial payments
+    # in binary floating point can land a fraction of a cent short of the
+    # total (e.g. three $416.65 payments on a $1,249.95 invoice), which
+    # would otherwise leave a fully-paid invoice stuck showing "PARTIAL".
+    total = round(clean_float(total), 2)
+    paid = round(clean_float(amount_paid), 2)
     if total <= 0:
         return "SAVED"
     if paid >= total:
@@ -250,12 +345,12 @@ def payment_status(total, amount_paid):
 def invoice_paid_total(record):
     payments = record.get("payments") or []
     if payments:
-        return sum(clean_float(payment.get("amount")) for payment in payments)
-    return clean_float(record.get("amount_paid", 0))
+        return round(sum(clean_float(payment.get("amount")) for payment in payments), 2)
+    return round(clean_float(record.get("amount_paid", 0)), 2)
 
 
 def invoice_balance(record):
-    return max(clean_float(record.get("total", 0)) - invoice_paid_total(record), 0)
+    return round(max(clean_float(record.get("total", 0)) - invoice_paid_total(record), 0), 2)
 
 
 def extract_customer_from_pdf_text(text):
@@ -351,12 +446,17 @@ class HomePage(QWidget):
         subtitle.setObjectName("mutedText")
         buttons = QHBoxLayout()
         buttons.setSpacing(12)
-        new_invoice = QPushButton("New Invoice")
-        new_estimate = QPushButton("New Estimate")
+        new_invoice = QPushButton("+ New Invoice")
+        new_estimate = QPushButton("+ New Estimate")
         new_invoice.setObjectName("primaryButton")
         new_estimate.setObjectName("primaryButton")
-        new_invoice.setMinimumHeight(42)
-        new_estimate.setMinimumHeight(42)
+        new_invoice.setMinimumHeight(52)
+        new_estimate.setMinimumHeight(52)
+        big_button_font = new_invoice.font()
+        big_button_font.setPointSize(big_button_font.pointSize() + 2)
+        big_button_font.setBold(True)
+        new_invoice.setFont(big_button_font)
+        new_estimate.setFont(big_button_font)
         new_invoice.clicked.connect(lambda: self.window.open_editor("invoice"))
         new_estimate.clicked.connect(lambda: self.window.open_editor("estimate"))
         buttons.addWidget(new_invoice)
@@ -369,19 +469,37 @@ class HomePage(QWidget):
 
         self.drafts = QListWidget()
         self.customers = QComboBox()
-        self.invoice_history = QListWidget()
-        self.estimate_history = QListWidget()
+        self.invoice_history = QTableWidget(0, 6)
+        self.invoice_history.setHorizontalHeaderLabels(["#", "Customer", "Total", "Balance", "Status", "Date"])
+        self.estimate_history = QTableWidget(0, 5)
+        self.estimate_history.setHorizontalHeaderLabels(["#", "Customer", "Total", "Status", "Date"])
         self.selected_history_type = None
         self.all_drafts = []
         self.all_customers = {}
         self.all_invoice_history = []
         self.all_estimate_history = []
-        for list_widget in [self.drafts, self.invoice_history, self.estimate_history]:
-            list_widget.setObjectName("panelList")
-            list_widget.setMinimumHeight(120)
-            list_widget.setMaximumHeight(180)
-            list_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            list_widget.setAlternatingRowColors(True)
+        self.drafts.setObjectName("panelList")
+        self.drafts.setMinimumHeight(160)
+        self.drafts.setMaximumHeight(280)
+        self.drafts.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.drafts.setAlternatingRowColors(True)
+        for table in [self.invoice_history, self.estimate_history]:
+            table.setObjectName("panelList")
+            table.setMinimumHeight(180)
+            table.setMaximumHeight(300)
+            table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            table.setAlternatingRowColors(True)
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.setSelectionMode(QAbstractItemView.SingleSelection)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.verticalHeader().setVisible(False)
+            table.verticalHeader().setDefaultSectionSize(34)
+            table.horizontalHeader().setMinimumHeight(34)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        for column in [0, 2, 3, 4, 5]:
+            self.invoice_history.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        for column in [0, 2, 3, 4]:
+            self.estimate_history.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.invoice_history.itemClicked.connect(self.select_invoice_history)
         self.estimate_history.itemClicked.connect(lambda _item: self.mark_history_selection("estimate"))
 
@@ -463,8 +581,11 @@ class HomePage(QWidget):
 
         invoices_tab = QWidget()
         invoices_layout = QVBoxLayout(invoices_tab)
-        invoices_layout.setSpacing(12)
+        invoices_layout.setSpacing(14)
         invoices_layout.addWidget(self.section_title("Saved Invoices"))
+        self.invoice_stats_label = QLabel("")
+        self.invoice_stats_label.setObjectName("mutedText")
+        invoices_layout.addWidget(self.invoice_stats_label)
         invoice_filter_row = QHBoxLayout()
         invoice_filter_row.setSpacing(10)
         self.invoice_search = QLineEdit()
@@ -487,8 +608,8 @@ class HomePage(QWidget):
         invoices_layout.addWidget(self.invoice_history)
         self.payment_history = QTextEdit()
         self.payment_history.setReadOnly(True)
-        self.payment_history.setMinimumHeight(70)
-        self.payment_history.setMaximumHeight(95)
+        self.payment_history.setMinimumHeight(90)
+        self.payment_history.setMaximumHeight(150)
         self.payment_history.setPlaceholderText("Select an invoice to see payment history.")
         invoices_layout.addWidget(self.payment_history)
         payment_row = QHBoxLayout()
@@ -506,25 +627,34 @@ class HomePage(QWidget):
         invoice_saved_actions.setSpacing(10)
         open_invoice = QPushButton("Open Invoice")
         open_invoice_pdf = QPushButton("Open Invoice PDF")
+        open_invoice.setObjectName("primaryButton")
+        open_invoice.clicked.connect(lambda: self.open_history("invoice"))
+        open_invoice_pdf.clicked.connect(lambda: self.open_history_pdf("invoice"))
+        invoice_saved_actions.addWidget(open_invoice)
+        invoice_saved_actions.addWidget(open_invoice_pdf)
+        invoice_saved_actions.addStretch(1)
+        invoices_layout.addLayout(invoice_saved_actions)
+
+        invoice_danger_actions = QHBoxLayout()
+        invoice_danger_actions.setSpacing(10)
         void_invoice = QPushButton("Void Invoice")
         delete_invoice = QPushButton("Delete Invoice")
         void_invoice.setObjectName("dangerButton")
         delete_invoice.setObjectName("dangerButton")
-        open_invoice.clicked.connect(lambda: self.open_history("invoice"))
-        open_invoice_pdf.clicked.connect(lambda: self.open_history_pdf("invoice"))
         void_invoice.clicked.connect(lambda: self.void_history_record("invoice"))
         delete_invoice.clicked.connect(lambda: self.delete_history_record("invoice"))
-        invoice_saved_actions.addWidget(open_invoice)
-        invoice_saved_actions.addWidget(open_invoice_pdf)
-        invoice_saved_actions.addWidget(void_invoice)
-        invoice_saved_actions.addWidget(delete_invoice)
-        invoice_saved_actions.addStretch(1)
-        invoices_layout.addLayout(invoice_saved_actions)
+        invoice_danger_actions.addStretch(1)
+        invoice_danger_actions.addWidget(void_invoice)
+        invoice_danger_actions.addWidget(delete_invoice)
+        invoices_layout.addLayout(invoice_danger_actions)
 
         estimates_tab = QWidget()
         estimates_layout = QVBoxLayout(estimates_tab)
-        estimates_layout.setSpacing(12)
+        estimates_layout.setSpacing(14)
         estimates_layout.addWidget(self.section_title("Saved Estimates"))
+        self.estimate_stats_label = QLabel("")
+        self.estimate_stats_label.setObjectName("mutedText")
+        estimates_layout.addWidget(self.estimate_stats_label)
         self.estimate_search = QLineEdit()
         self.estimate_search.setPlaceholderText("Search estimates")
         self.estimate_search.textChanged.connect(self.populate_estimate_history)
@@ -535,23 +665,29 @@ class HomePage(QWidget):
         open_estimate = QPushButton("Open Estimate")
         open_estimate_pdf = QPushButton("Open Estimate PDF")
         make_invoice = QPushButton("Make Invoice From Estimate")
-        void_estimate = QPushButton("Void Estimate")
-        delete_estimate = QPushButton("Delete Estimate")
+        open_estimate.setObjectName("primaryButton")
         make_invoice.setObjectName("primaryButton")
-        void_estimate.setObjectName("dangerButton")
-        delete_estimate.setObjectName("dangerButton")
         open_estimate.clicked.connect(lambda: self.open_history("estimate"))
         open_estimate_pdf.clicked.connect(lambda: self.open_history_pdf("estimate"))
         make_invoice.clicked.connect(self.make_invoice_from_estimate)
-        void_estimate.clicked.connect(lambda: self.void_history_record("estimate"))
-        delete_estimate.clicked.connect(lambda: self.delete_history_record("estimate"))
         estimate_saved_actions.addWidget(open_estimate)
         estimate_saved_actions.addWidget(open_estimate_pdf)
         estimate_saved_actions.addWidget(make_invoice)
-        estimate_saved_actions.addWidget(void_estimate)
-        estimate_saved_actions.addWidget(delete_estimate)
         estimate_saved_actions.addStretch(1)
         estimates_layout.addLayout(estimate_saved_actions)
+
+        estimate_danger_actions = QHBoxLayout()
+        estimate_danger_actions.setSpacing(10)
+        void_estimate = QPushButton("Void Estimate")
+        delete_estimate = QPushButton("Delete Estimate")
+        void_estimate.setObjectName("dangerButton")
+        delete_estimate.setObjectName("dangerButton")
+        void_estimate.clicked.connect(lambda: self.void_history_record("estimate"))
+        delete_estimate.clicked.connect(lambda: self.delete_history_record("estimate"))
+        estimate_danger_actions.addStretch(1)
+        estimate_danger_actions.addWidget(void_estimate)
+        estimate_danger_actions.addWidget(delete_estimate)
+        estimates_layout.addLayout(estimate_danger_actions)
 
         settings_tab = QWidget()
         settings_layout = QVBoxLayout(settings_tab)
@@ -708,7 +844,7 @@ class HomePage(QWidget):
 
     def populate_invoice_history(self):
         query = self.invoice_search.text().strip() if hasattr(self, "invoice_search") else ""
-        self.invoice_history.clear()
+        self.invoice_history.setRowCount(0)
         sort_choice = self.invoice_sort.currentText() if hasattr(self, "invoice_sort") else "Newest / Number"
         reverse = sort_choice in ["Newest / Number", "Date", "Total", "Balance"]
         records = sorted(self.all_invoice_history, key=self.invoice_sort_key, reverse=reverse)
@@ -732,17 +868,44 @@ class HomePage(QWidget):
                 balance,
             ):
                 continue
-            item = QListWidgetItem(
-                f"{record.get('invoice_number', '')} - {record.get('customer_name_big') or 'No customer'} - "
-                f"Total {money(record.get('total', 0))} - Paid {money(paid)} - Balance {money(balance)} - {status}"
-            )
-            item.setData(Qt.UserRole, record)
-            self.invoice_history.addItem(item)
+            row = self.invoice_history.rowCount()
+            self.invoice_history.insertRow(row)
+            values = [
+                str(record.get("invoice_number", "")),
+                record.get("customer_name_big") or "No customer",
+                money(record.get("total", 0)),
+                money(balance),
+                status,
+                friendly_date(record.get("invoice_date", "")),
+            ]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setData(Qt.UserRole, record)
+                cell.setTextAlignment(Qt.AlignVCenter | (Qt.AlignLeft if column in (0, 1) else Qt.AlignCenter))
+                if status == "VOID":
+                    cell.setForeground(QColor("#9b1c1c"))
+                elif status == "PAID":
+                    cell.setForeground(QColor("#1a7f43"))
+                self.invoice_history.setItem(row, column, cell)
         self.update_payment_history()
+        self.update_invoice_stats()
+
+    def update_invoice_stats(self):
+        if not hasattr(self, "invoice_stats_label"):
+            return
+        count = len(self.all_invoice_history)
+        outstanding = sum(
+            invoice_balance(record) for record in self.all_invoice_history
+            if record.get("status") != "VOID"
+        )
+        label = "No invoices saved yet" if count == 0 else (
+            f"{count} invoice{'s' if count != 1 else ''} saved  ·  {money(outstanding)} outstanding"
+        )
+        self.invoice_stats_label.setText(label)
 
     def populate_estimate_history(self):
         query = self.estimate_search.text().strip() if hasattr(self, "estimate_search") else ""
-        self.estimate_history.clear()
+        self.estimate_history.setRowCount(0)
         for record in self.all_estimate_history:
             status = record.get("status") or "SAVED"
             if not self.search_match(
@@ -757,12 +920,30 @@ class HomePage(QWidget):
                 record.get("total"),
             ):
                 continue
-            item = QListWidgetItem(
-                f"{record.get('invoice_number', '')} - {record.get('customer_name_big') or 'No customer'} - "
-                f"{money(record.get('total', 0))} - {status}"
-            )
-            item.setData(Qt.UserRole, record)
-            self.estimate_history.addItem(item)
+            row = self.estimate_history.rowCount()
+            self.estimate_history.insertRow(row)
+            values = [
+                str(record.get("invoice_number", "")),
+                record.get("customer_name_big") or "No customer",
+                money(record.get("total", 0)),
+                status,
+                friendly_date(record.get("invoice_date", "")),
+            ]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setData(Qt.UserRole, record)
+                cell.setTextAlignment(Qt.AlignVCenter | (Qt.AlignLeft if column in (0, 1) else Qt.AlignCenter))
+                if status == "VOID":
+                    cell.setForeground(QColor("#9b1c1c"))
+                self.estimate_history.setItem(row, column, cell)
+        self.update_estimate_stats()
+
+    def update_estimate_stats(self):
+        if not hasattr(self, "estimate_stats_label"):
+            return
+        count = len(self.all_estimate_history)
+        label = "No estimates saved yet" if count == 0 else f"{count} estimate{'s' if count != 1 else ''} saved"
+        self.estimate_stats_label.setText(label)
 
     def selected_item_data(self, list_widget):
         item = list_widget.currentItem()
@@ -800,7 +981,7 @@ class HomePage(QWidget):
         ]
         if payments:
             for index, payment in enumerate(payments, start=1):
-                lines.append(f"{index}. {payment.get('date') or ''} - {money(payment.get('amount', 0))}")
+                lines.append(f"{index}. {friendly_date(payment.get('date'))} - {money(payment.get('amount', 0))}")
         else:
             lines.append("No payments recorded yet.")
         self.payment_history.setPlainText("\n".join(lines))
@@ -813,6 +994,16 @@ class HomePage(QWidget):
     def delete_selected_draft(self):
         draft = self.selected_item_data(self.drafts)
         if not draft:
+            return
+        label = draft.get("customer_name_big") or draft.get("project_name") or "this draft"
+        answer = QMessageBox.question(
+            self,
+            "Delete Draft",
+            f"Delete \"{label}\"? This unfinished work can't be recovered.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         drafts = [item for item in read_json(DRAFTS_FILE, []) if item.get("draft_id") != draft.get("draft_id")]
         write_json(DRAFTS_FILE, drafts)
@@ -869,6 +1060,16 @@ class HomePage(QWidget):
     def delete_customer(self):
         customer = self.customers.currentData()
         if not customer:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete Customer",
+            f"Delete \"{customer.get('name', '')}\" from saved customers?\n\n"
+            "Their past invoices and estimates are not affected - only the saved contact card.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         customers = read_json(CUSTOMERS_FILE, {})
         customers.pop(customer["name"], None)
@@ -1036,7 +1237,7 @@ class HomePage(QWidget):
                     "date": today_text(),
                     "saved_at": datetime.today().strftime("%Y/%m/%d %H:%M:%S"),
                 })
-                paid = sum(clean_float(item.get("amount")) for item in payments)
+                paid = round(sum(clean_float(item.get("amount")) for item in payments), 2)
                 saved["payments"] = payments
                 saved["amount_paid"] = str(paid)
                 saved["balance_due"] = invoice_balance(saved)
@@ -1052,7 +1253,8 @@ class HomePage(QWidget):
             QMessageBox.information(
                 self,
                 "Payment Recorded",
-                f"Payment added: {money(payment)}\n"
+                f"Payment added: {money(payment)} on {friendly_date(today_text())}\n"
+                f"Total: {money(updated_record.get('total', 0))}\n"
                 f"Balance left: {money(updated_record.get('balance_due', 0))}",
             )
 
@@ -1101,6 +1303,17 @@ class HomePage(QWidget):
         record = self.selected_history_record(document_type)
         if not record:
             QMessageBox.information(self, "Void", f"Select a saved {document_type} first.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Void",
+            f"Mark {document_type} {record.get('invoice_number', '')} as VOID?\n\n"
+            "This flags it as cancelled everywhere it's listed. It stays in your records but "
+            "payments can no longer be recorded against it.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         history_file = self.history_file(document_type)
         history = read_json(history_file, [])
@@ -1171,31 +1384,9 @@ class HomePage(QWidget):
         self.refresh()
 
     def create_backup(self):
-        os.makedirs(BACKUP_DIR, exist_ok=True)
         timestamp = datetime.today().strftime("%Y%m%d_%H%M%S")
         backup_path = os.path.join(BACKUP_DIR, f"adael_backup_{timestamp}.zip")
-        files = [
-            DRAFTS_FILE,
-            CUSTOMERS_FILE,
-            INVOICE_HISTORY_FILE,
-            ESTIMATE_HISTORY_FILE,
-            SETTINGS_FILE,
-            INVOICE_COUNTER_FILE,
-            ESTIMATE_COUNTER_FILE,
-            PAST_INVOICE_COUNTER_FILE,
-            WRITABLE_LOGO_PATH,
-        ]
-        with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as backup:
-            for path in files:
-                if os.path.exists(path):
-                    backup.write(path, os.path.basename(path))
-            for folder in ["invoices", "estimates"]:
-                folder_path = os.path.join(APP_DIR, folder)
-                if os.path.exists(folder_path):
-                    for filename in os.listdir(folder_path):
-                        full_path = os.path.join(folder_path, filename)
-                        if os.path.isfile(full_path):
-                            backup.write(full_path, os.path.join(folder, filename))
+        write_backup_zip(backup_path)
         QDesktopServices.openUrl(QUrl.fromLocalFile(BACKUP_DIR))
         QMessageBox.information(self, "Backup Created", f"Backup saved here:\n{backup_path}")
 
@@ -1206,6 +1397,7 @@ class HomePage(QWidget):
         new_invoice = estimate.copy()
         new_invoice["document_type"] = "invoice"
         new_invoice["invoice_number"] = get_next_number("invoice")
+        increase_number("invoice")
         new_invoice["invoice_date"] = today_text()
         new_invoice["amount_paid"] = ""
         new_invoice["payments"] = []
@@ -1223,6 +1415,7 @@ class EditorPage(QWidget):
         self.document_type = "invoice"
         self.loaded_history = False
         self.current_draft_id = None
+        self.current_payments = []
 
         # Outer layout holds only the scroll area — fixes fullscreen cut-off
         outer = QVBoxLayout(self)
@@ -1294,17 +1487,19 @@ class EditorPage(QWidget):
         form_grid.addWidget(self.project_name, 6, 1, 1, 3)
         layout.addLayout(form_grid)
 
-        self.items = QTableWidget(0, 4)
-        self.items.setHorizontalHeaderLabels(["Description", "Qty", "Unit Price", "Amount"])
+        self.items = QTableWidget(0, 5)
+        self.items.setHorizontalHeaderLabels(["Item", "Description", "Qty", "Unit Price", "Amount"])
         self.items.setAlternatingRowColors(True)
         self.items.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.items.verticalHeader().setVisible(False)
         self.items.verticalHeader().setDefaultSectionSize(42)
         self.items.verticalHeader().setMinimumSectionSize(42)
         self.items.setMinimumHeight(310)
-        self.items.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.items.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.items.setColumnWidth(0, 170)
+        self.items.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.items.horizontalHeader().setMinimumHeight(38)
-        for column in [1, 2, 3]:
+        for column in [2, 3, 4]:
             self.items.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.items.itemChanged.connect(self.handle_item_changed)
         layout.addWidget(self.items, 1)
@@ -1333,6 +1528,9 @@ class EditorPage(QWidget):
         totals_box = QFormLayout()
         totals_box.setSpacing(10)
         self.additional = QLineEdit()
+        self.discount = QLineEdit()
+        self.discount.setPlaceholderText("e.g. 50 or 10%")
+        self.discount.setToolTip("Type a flat dollar amount (50) or a percentage off the subtotal (10%)")
         self.amount_paid = QLineEdit()
         self.subtotal_label = QLabel("$0.00")
         self.total_label = QLabel("$0.00")
@@ -1345,10 +1543,12 @@ class EditorPage(QWidget):
         self.preview_button.clicked.connect(self.preview_pdf)
         self.generate_button.clicked.connect(self.generate_pdf)
         self.additional.textChanged.connect(self.recalculate)
+        self.discount.textChanged.connect(self.recalculate)
         self.amount_paid.textChanged.connect(self.recalculate)
+        totals_box.addRow("Subtotal", self.subtotal_label)
+        totals_box.addRow("Discount", self.discount)
         totals_box.addRow("Other Charges", self.additional)
         totals_box.addRow("Amount Paid", self.amount_paid)
-        totals_box.addRow("Subtotal", self.subtotal_label)
         totals_box.addRow("Total", self.total_label)
         totals_box.addRow("Balance Due", self.balance_label)
         totals_box.addRow(self.preview_button)
@@ -1370,7 +1570,25 @@ class EditorPage(QWidget):
         self.preview_button.setText(f"Preview {title.title()} PDF")
         self.generate_button.setText(f"Generate {title.title()} PDF")
         self.amount_paid.setVisible(document_type == "invoice")
-        self.number.setText(str(data.get("invoice_number") or get_next_number(document_type)))
+        self.current_payments = data.get("payments") or []
+        # Once an invoice has real payment history, only "Record Payment" on the
+        # Home screen should touch it - editing here and resaving must never
+        # overwrite or collapse the dated payment records.
+        self.amount_paid.setReadOnly(document_type == "invoice" and bool(self.current_payments))
+        self.amount_paid.setToolTip(
+            "Use \"Record Payment\" from the Home screen to add payments - "
+            "editing this box won't change anything once payments exist."
+            if self.current_payments else ""
+        )
+        if data.get("invoice_number"):
+            self.number.setText(str(data.get("invoice_number")))
+        else:
+            # Brand new document - reserve this number right away so opening
+            # a second new invoice/estimate before finishing this one can
+            # never end up reusing the same number and overwriting it later.
+            reserved_number = get_next_number(document_type)
+            increase_number(document_type)
+            self.number.setText(str(reserved_number))
         self.date.setText(str(data.get("invoice_date") or today_text()))
         self.customer_name.setText(str(data.get("customer_name_big", "")))
         self.customer_phone.setText(str(data.get("customer_phone_small", "")))
@@ -1381,6 +1599,7 @@ class EditorPage(QWidget):
         default_notes = get_settings().get("default_notes", "")
         self.notes.setPlainText(str(data.get("notes", default_notes)))
         self.additional.setText(str(data.get("additional_subtotal", "")))
+        self.discount.setText(str(data.get("discount", "")))
         self.amount_paid.setText(str(data.get("amount_paid", "")))
         self.items.blockSignals(True)
         self.items.setRowCount(0)
@@ -1418,11 +1637,12 @@ class EditorPage(QWidget):
 
     def add_item(self, item=None, block=False):
         if item is None:
-            item = {"description": "", "qty": "", "price": ""}
+            item = {"title": "", "description": "", "qty": "", "price": ""}
         row = self.items.rowCount()
         self.items.insertRow(row)
         self.items.setRowHeight(row, 42)
         values = [
+            item.get("title", ""),
             item.get("description", ""),
             item.get("qty", ""),
             item.get("price", ""),
@@ -1430,12 +1650,13 @@ class EditorPage(QWidget):
         ]
         for column, value in enumerate(values):
             table_item = QTableWidgetItem(str(value))
-            alignment = Qt.AlignVCenter | (Qt.AlignLeft if column == 0 else Qt.AlignCenter)
+            alignment = Qt.AlignVCenter | (Qt.AlignLeft if column in (0, 1) else Qt.AlignCenter)
             table_item.setTextAlignment(alignment)
-            if column == 3:
+            if column == 4:
                 table_item.setFlags(table_item.flags() & ~Qt.ItemIsEditable)
             self.items.setItem(row, column, table_item)
-        self.mark_item_spelling(row)
+        self.mark_item_spelling(row, 0)
+        self.mark_item_spelling(row, 1)
         if not block:
             self.recalculate()
             self.items.setCurrentCell(row, 0)
@@ -1443,9 +1664,25 @@ class EditorPage(QWidget):
 
     def delete_item(self):
         row = self.items.currentRow()
-        if row >= 0:
-            self.items.removeRow(row)
-            self.recalculate()
+        if row < 0:
+            return
+        title = self.cell_text(row, 0).strip()
+        description = self.cell_text(row, 1).strip()
+        qty = self.cell_text(row, 2).strip()
+        price = self.cell_text(row, 3).strip()
+        if title or description or qty or price:
+            label = title or description or "this line item"
+            answer = QMessageBox.question(
+                self,
+                "Delete Item",
+                f"Delete \"{label}\"?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        self.items.removeRow(row)
+        self.recalculate()
 
     def handle_item_changed(self, item):
         try:
@@ -1454,13 +1691,14 @@ class EditorPage(QWidget):
         except RuntimeError:
             return
         self.recalculate()
-        if column == 0:
-            self.mark_item_spelling(row)
+        if column in (0, 1):
+            self.mark_item_spelling(row, column)
 
     def update_spelling_marks(self):
         self.mark_notes_spelling()
         for row in range(self.items.rowCount()):
-            self.mark_item_spelling(row)
+            self.mark_item_spelling(row, 0)
+            self.mark_item_spelling(row, 1)
 
     def mark_notes_spelling(self):
         selections = []
@@ -1477,8 +1715,8 @@ class EditorPage(QWidget):
             selections.append(selection)
         self.notes.setExtraSelections(selections)
 
-    def mark_item_spelling(self, row):
-        item = self.items.item(row, 0)
+    def mark_item_spelling(self, row, column):
+        item = self.items.item(row, column)
         if not item:
             return
         issues = text_issues(item.text())
@@ -1497,9 +1735,10 @@ class EditorPage(QWidget):
         items = []
         for row in range(self.items.rowCount()):
             items.append({
-                "description": self.cell_text(row, 0),
-                "qty": self.cell_text(row, 1),
-                "price": self.cell_text(row, 2),
+                "title": self.cell_text(row, 0),
+                "description": self.cell_text(row, 1),
+                "qty": self.cell_text(row, 2),
+                "price": self.cell_text(row, 3),
             })
         return items
 
@@ -1511,21 +1750,23 @@ class EditorPage(QWidget):
         subtotal = 0
         for item in self.item_data():
             qty_text = str(item.get("qty", "")).strip()
-            qty = clean_int(qty_text)
+            qty = clean_float(qty_text)
             price = clean_float(item.get("price", ""))
             if price and not qty_text:
                 qty = 1
             subtotal += qty * price
+        subtotal = round(subtotal, 2)
         additional = clean_float(self.additional.text())
-        total = subtotal + additional
+        discount = resolve_discount(self.discount.text(), subtotal)
+        total = round(max(subtotal - discount + additional, 0), 2)
         paid = clean_float(self.amount_paid.text()) if self.document_type == "invoice" else 0
-        return subtotal, additional, total, paid, max(total - paid, 0)
+        return subtotal, additional, discount, total, paid, round(max(total - paid, 0), 2)
 
     def recalculate(self):
         self.items.blockSignals(True)
         for row, item in enumerate(self.item_data()):
             qty_text = str(item.get("qty", "")).strip()
-            qty = clean_int(qty_text)
+            qty = clean_float(qty_text)
             price = clean_float(item.get("price", ""))
             if price and not qty_text:
                 qty = 1
@@ -1533,15 +1774,15 @@ class EditorPage(QWidget):
             amount_item = QTableWidgetItem(money(amount))
             amount_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignCenter)
             amount_item.setFlags(amount_item.flags() & ~Qt.ItemIsEditable)
-            self.items.setItem(row, 3, amount_item)
+            self.items.setItem(row, 4, amount_item)
         self.items.blockSignals(False)
-        subtotal, _, total, _, balance = self.totals()
+        subtotal, _, _, total, _, balance = self.totals()
         self.subtotal_label.setText(money(subtotal))
         self.total_label.setText(money(total))
         self.balance_label.setText(money(balance))
 
     def document_data(self):
-        subtotal, additional, total, paid, balance = self.totals()
+        subtotal, additional, discount, total, paid, balance = self.totals()
         return {
             "draft_id": self.current_draft_id or f"{self.document_type}_{self.number.text()}",
             "document_type": self.document_type,
@@ -1557,7 +1798,9 @@ class EditorPage(QWidget):
             "items": self.item_data(),
             "notes": self.notes.toPlainText(),
             "additional_subtotal": self.additional.text(),
+            "discount": self.discount.text(),
             "amount_paid": self.amount_paid.text(),
+            "payments": self.current_payments,
             "subtotal": subtotal,
             "total": total,
             "balance_due": balance,
@@ -1575,8 +1818,13 @@ class EditorPage(QWidget):
             data["customer_city_state_zip"].strip(),
             notes and notes != default_notes,
             str(data["additional_subtotal"]).strip(),
+            str(data["discount"]).strip(),
             data["document_type"] == "invoice" and str(data["amount_paid"]).strip(),
-            any(item["description"].strip() or str(item["qty"]).strip() or str(item["price"]).strip() for item in data["items"]),
+            any(
+                item.get("title", "").strip() or item["description"].strip()
+                or str(item["qty"]).strip() or str(item["price"]).strip()
+                for item in data["items"]
+            ),
         ])
 
     def save_draft(self):
@@ -1615,11 +1863,9 @@ class EditorPage(QWidget):
             self.save_customer(data)
             self.save_history(data, pdf_path)
             self.clear_current_draft(data["draft_id"])
-            if not self.loaded_history:
-                increase_number(self.document_type)
             QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
             QMessageBox.information(self, "PDF Created", f"Saved and opened PDF:\n{pdf_path}")
-            self._offer_sms(data)
+            self._offer_send(data)
             self.window.show_home()
         except Exception as error:
             QMessageBox.critical(
@@ -1630,9 +1876,9 @@ class EditorPage(QWidget):
                 f"Details: {error}"
             )
 
-    def _offer_sms(self, data):
-        phone_raw = data.get("customer_phone_small", "").strip()
-        if not phone_raw:
+    def _offer_send(self, data):
+        email_raw = data.get("customer_email_small", "").strip()
+        if not email_raw:
             return
         doc_label = "Estimate" if self.document_type == "estimate" else "Invoice"
         doc_num = data.get("invoice_number", "")
@@ -1649,21 +1895,23 @@ class EditorPage(QWidget):
             f"Please reach out with any questions."
         )
 
-        box = QMessageBox(self)
-        box.setWindowTitle(f"Send {doc_label} by Text")
-        box.setText(
-            f"Send a text to {phone_raw}?\n\n"
-            f"This will open your phone's messaging app (via Phone Link) "
-            f"pre-filled with the message. Just tap Send.\n\n"
-            f"Message preview:\n{msg_body}"
+        answer = QMessageBox.question(
+            self,
+            f"Send {doc_label}",
+            f"Open Yahoo Mail to email this {doc_label.lower()} to {email_raw}?\n\n"
+            f"Message preview:\n{msg_body}\n\n"
+            f"(The PDF opened on this computer — attach it to the email before sending.)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
         )
-        send_btn = box.addButton(f"Open Messaging App", QMessageBox.AcceptRole)
-        box.addButton("Skip", QMessageBox.RejectRole)
-        box.exec()
-        if box.clickedButton() == send_btn:
-            phone_digits = re.sub(r"\D", "", phone_raw)
-            sms_body = urllib.parse.quote(msg_body)
-            QDesktopServices.openUrl(QUrl(f"sms:{phone_digits}?body={sms_body}"))
+        if answer != QMessageBox.Yes:
+            return
+        subject = urllib.parse.quote(f"{doc_label} #{doc_num} from {company}")
+        email_body = urllib.parse.quote(msg_body)
+        to_address = urllib.parse.quote(email_raw)
+        QDesktopServices.openUrl(QUrl(
+            f"https://compose.mail.yahoo.com/?to={to_address}&subject={subject}&body={email_body}"
+        ))
 
     def save_customer(self, data):
         name = data["customer_name_big"].strip()
@@ -1694,10 +1942,10 @@ class EditorPage(QWidget):
                     "date": today_text(),
                     "saved_at": data["saved_at"],
                 })
-            paid = sum(clean_float(payment.get("amount")) for payment in payments)
+            paid = round(sum(clean_float(payment.get("amount")) for payment in payments), 2)
             data["payments"] = payments
             data["amount_paid"] = str(paid)
-            data["balance_due"] = max(clean_float(data["total"]) - paid, 0)
+            data["balance_due"] = round(max(clean_float(data["total"]) - paid, 0), 2)
             data["status"] = payment_status(data["total"], paid)
         else:
             data["status"] = "SAVED"
@@ -1732,22 +1980,47 @@ class EditorPage(QWidget):
             logo_html = '<div style="font-size:24px; font-weight:bold; color:#4b7391;">ADAEL<br>CONSTRUCTION</div>'
         rows = ""
         for index, item in enumerate(data["items"], start=1):
-            qty = clean_int(item.get("qty", "")) or (1 if clean_float(item.get("price", "")) else 0)
+            qty = clean_float(item.get("qty", "")) or (1 if clean_float(item.get("price", "")) else 0)
             price = clean_float(item.get("price", ""))
+            title = item.get("title", "").strip()
+            description = item.get("description", "").strip()
+            if title and description:
+                item_html = f'<strong>{html.escape(title)}</strong><br><span style="font-size:12px; color:#555;">{html.escape(description)}</span>'
+            else:
+                item_html = f'<strong>{html.escape(title or description)}</strong>'
             rows += f"""
             <tr>
                 <td>{index}</td>
-                <td>{html.escape(item.get("description", ""))}</td>
-                <td>{qty}</td>
+                <td>{item_html}</td>
+                <td>{format_qty(qty)}</td>
                 <td>{money(price)}</td>
                 <td>{money(qty * price)}</td>
             </tr>
             """
 
+        discount_text_raw = str(data.get("discount", "")).strip()
+        discount_amount = resolve_discount(discount_text_raw, data.get("subtotal", 0))
+        discount_label = f"Discount ({discount_text_raw})" if discount_text_raw.endswith("%") else "Discount"
+        discount_html = (
+            f'<div><strong>{discount_label}:</strong> -{money(discount_amount)}</div>' if discount_amount else ""
+        )
+
         payment_html = ""
         if self.document_type == "invoice":
+            payments_list = data.get("payments") or []
+            payment_log_html = ""
+            if payments_list:
+                payment_log_html = "<div style=\"margin-top:6px;\">"
+                for entry in payments_list:
+                    payment_log_html += (
+                        f'<div style="font-size:13px; color:#3f627c;">'
+                        f'{html.escape(friendly_date(entry.get("date")))} &mdash; '
+                        f'{money(entry.get("amount", 0))} received</div>'
+                    )
+                payment_log_html += "</div>"
             payment_html = f"""
             <div><strong>Amount Paid:</strong> {money(data["amount_paid"])}</div>
+            {payment_log_html}
             <div><strong>Balance Due:</strong> {money(data["balance_due"])}</div>
             """
 
@@ -1826,6 +2099,7 @@ class EditorPage(QWidget):
                 <div class="totals">
                     <div class="totals-lines">
                         <div><strong>Subtotal:</strong> {money(data["subtotal"])}</div>
+                        {discount_html}
                         <div><strong>{additional_label}:</strong> {money(data["additional_subtotal"])}</div>
                         {payment_html}
                     </div>
@@ -1841,6 +2115,13 @@ class EditorPage(QWidget):
         output_dir = PREVIEW_DIR if preview else os.path.join(APP_DIR, folder)
         os.makedirs(output_dir, exist_ok=True)
         if preview:
+            # Previews are throwaway - clear out old ones so this folder
+            # never quietly fills up with hundreds of leftover files.
+            for old_file in os.listdir(PREVIEW_DIR):
+                try:
+                    os.remove(os.path.join(PREVIEW_DIR, old_file))
+                except OSError:
+                    pass
             timestamp = datetime.today().strftime("%Y%m%d_%H%M%S")
             filename = f"preview_{folder[:-1]}_{data['invoice_number']}_{timestamp}.pdf"
         else:
@@ -1990,6 +2271,8 @@ def main():
     if run_update_check_if_available(app):
         sys.exit(0)
 
+    auto_backup_if_needed()
+
     app.setStyleSheet("""
         QWidget {
             font-family: "Segoe UI", Arial;
@@ -2077,6 +2360,19 @@ def main():
         QTableWidget::item {
             padding: 2px 7px;
         }
+        QTableWidget::item:selected {
+            background: #d9e8f2;
+            color: #1f2933;
+        }
+        QTableWidget QLineEdit {
+            background: #ffffff;
+            border: 2px solid #4b7391;
+            border-radius: 3px;
+            padding: 4px 6px;
+            color: #1f2933;
+            selection-background-color: #4b7391;
+            selection-color: #ffffff;
+        }
         QWidget#totalsPanel {
             background: #ffffff;
             border: 1px solid #c7d7e4;
@@ -2092,7 +2388,7 @@ def main():
         }
     """)
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 
