@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -67,7 +68,7 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.5"
+CURRENT_VERSION = "1.0.6"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -351,6 +352,42 @@ def invoice_paid_total(record):
 
 def invoice_balance(record):
     return round(max(clean_float(record.get("total", 0)) - invoice_paid_total(record), 0), 2)
+
+
+def apply_invoice_payment(invoice_number, amount_text):
+    """Adds a dated payment to the saved invoice history record matching
+    invoice_number. Shared by the Home screen's Record Payment flow and the
+    "+ Add Payment" button inside the invoice editor, so both go through the
+    exact same math and never drift out of sync.
+    Returns (ok, applied_amount_or_error_message, updated_record_or_None)."""
+    payment = round(clean_float(amount_text), 2)
+    if payment <= 0:
+        return False, "Enter a payment amount greater than $0.00.", None
+
+    history = read_json(INVOICE_HISTORY_FILE, [])
+    for saved in history:
+        if str(saved.get("invoice_number")) == str(invoice_number):
+            if saved.get("status") == "VOID":
+                return False, "This invoice is void, so a payment cannot be added.", None
+            current_balance = invoice_balance(saved)
+            if current_balance <= 0:
+                return False, "This invoice is already fully paid.", None
+            applied = min(payment, current_balance)
+            payments = saved.get("payments") or []
+            payments.append({
+                "amount": applied,
+                "date": today_text(),
+                "saved_at": datetime.today().strftime("%Y/%m/%d %H:%M:%S"),
+            })
+            paid = round(sum(clean_float(item.get("amount")) for item in payments), 2)
+            saved["payments"] = payments
+            saved["amount_paid"] = str(paid)
+            saved["balance_due"] = invoice_balance(saved)
+            saved["status"] = payment_status(saved.get("total", 0), paid)
+            write_json(INVOICE_HISTORY_FILE, history)
+            return True, applied, saved
+
+    return False, "That invoice could not be found in saved history.", None
 
 
 def extract_customer_from_pdf_text(text):
@@ -1213,50 +1250,20 @@ class HomePage(QWidget):
         if not record:
             QMessageBox.information(self, "Record Payment", "Select a saved invoice first.")
             return
-        if record.get("status") == "VOID":
-            QMessageBox.warning(self, "Record Payment", "This invoice is void, so a payment cannot be added.")
+        ok, result, updated_record = apply_invoice_payment(record.get("invoice_number"), self.payment_amount.text())
+        if not ok:
+            QMessageBox.warning(self, "Record Payment", result)
             return
-        payment = clean_float(self.payment_amount.text())
-        if payment <= 0:
-            QMessageBox.warning(self, "Record Payment", "Enter a payment amount greater than $0.00.")
-            return
-        current_balance = invoice_balance(record)
-        if current_balance <= 0:
-            QMessageBox.information(self, "Record Payment", "This invoice is already fully paid.")
-            return
-        if payment > current_balance:
-            payment = current_balance
-
-        history = read_json(INVOICE_HISTORY_FILE, [])
-        updated_record = None
-        for saved in history:
-            if saved.get("invoice_number") == record.get("invoice_number"):
-                payments = saved.get("payments") or []
-                payments.append({
-                    "amount": payment,
-                    "date": today_text(),
-                    "saved_at": datetime.today().strftime("%Y/%m/%d %H:%M:%S"),
-                })
-                paid = round(sum(clean_float(item.get("amount")) for item in payments), 2)
-                saved["payments"] = payments
-                saved["amount_paid"] = str(paid)
-                saved["balance_due"] = invoice_balance(saved)
-                saved["status"] = payment_status(saved.get("total", 0), paid)
-                updated_record = saved
-                break
-
-        write_json(INVOICE_HISTORY_FILE, history)
         self.payment_amount.clear()
         self.refresh()
         self.update_payment_history()
-        if updated_record:
-            QMessageBox.information(
-                self,
-                "Payment Recorded",
-                f"Payment added: {money(payment)} on {friendly_date(today_text())}\n"
-                f"Total: {money(updated_record.get('total', 0))}\n"
-                f"Balance left: {money(updated_record.get('balance_due', 0))}",
-            )
+        QMessageBox.information(
+            self,
+            "Payment Recorded",
+            f"Payment added: {money(result)} on {friendly_date(today_text())}\n"
+            f"Total: {money(updated_record.get('total', 0))}\n"
+            f"Balance left: {money(updated_record.get('balance_due', 0))}",
+        )
 
     def open_history(self, document_type):
         record = self.selected_item_data(self.invoice_history if document_type == "invoice" else self.estimate_history)
@@ -1416,6 +1423,10 @@ class EditorPage(QWidget):
         self.loaded_history = False
         self.current_draft_id = None
         self.current_payments = []
+        self.loaded_pdf_path = ""
+        self.loaded_pdf_name = ""
+        self.loaded_saved_at = ""
+        self.loaded_status = ""
 
         # Outer layout holds only the scroll area — fixes fullscreen cut-off
         outer = QVBoxLayout(self)
@@ -1487,6 +1498,13 @@ class EditorPage(QWidget):
         form_grid.addWidget(self.project_name, 6, 1, 1, 3)
         layout.addLayout(form_grid)
 
+        self.payment_summary = QLabel()
+        self.payment_summary.setObjectName("paymentSummary")
+        self.payment_summary.setWordWrap(True)
+        self.payment_summary.setTextFormat(Qt.RichText)
+        self.payment_summary.setVisible(False)
+        layout.addWidget(self.payment_summary)
+
         self.items = QTableWidget(0, 5)
         self.items.setHorizontalHeaderLabels(["Item", "Description", "Qty", "Unit Price", "Amount"])
         self.items.setAlternatingRowColors(True)
@@ -1535,11 +1553,18 @@ class EditorPage(QWidget):
         self.subtotal_label = QLabel("$0.00")
         self.total_label = QLabel("$0.00")
         self.balance_label = QLabel("$0.00")
+        self.add_payment_button = QPushButton("+ Add Payment")
+        self.add_payment_button.setObjectName("secondaryButton")
+        self.add_payment_button.clicked.connect(self.add_payment)
+        self.save_button = QPushButton("Save Changes")
+        self.save_button.setObjectName("secondaryButton")
+        self.save_button.clicked.connect(self.save_changes)
         self.preview_button = QPushButton("Preview PDF")
         self.generate_button = QPushButton("Generate PDF")
         self.preview_button.setMinimumHeight(42)
         self.generate_button.setObjectName("primaryButton")
         self.generate_button.setMinimumHeight(42)
+        self.save_button.setMinimumHeight(42)
         self.preview_button.clicked.connect(self.preview_pdf)
         self.generate_button.clicked.connect(self.generate_pdf)
         self.additional.textChanged.connect(self.recalculate)
@@ -1549,8 +1574,10 @@ class EditorPage(QWidget):
         totals_box.addRow("Discount", self.discount)
         totals_box.addRow("Other Charges", self.additional)
         totals_box.addRow("Amount Paid", self.amount_paid)
+        totals_box.addRow(self.add_payment_button)
         totals_box.addRow("Total", self.total_label)
         totals_box.addRow("Balance Due", self.balance_label)
+        totals_box.addRow(self.save_button)
         totals_box.addRow(self.preview_button)
         totals_box.addRow(self.generate_button)
         totals_widget = QWidget()
@@ -1571,15 +1598,37 @@ class EditorPage(QWidget):
         self.generate_button.setText(f"Generate {title.title()} PDF")
         self.amount_paid.setVisible(document_type == "invoice")
         self.current_payments = data.get("payments") or []
-        # Once an invoice has real payment history, only "Record Payment" on the
-        # Home screen should touch it - editing here and resaving must never
-        # overwrite or collapse the dated payment records.
+        # Keep hold of fields that aren't part of the editable form, so
+        # "Save Changes" can write them back untouched instead of blanking
+        # them out or triggering a brand-new PDF/history entry.
+        self.loaded_pdf_path = data.get("pdf_path", "")
+        self.loaded_pdf_name = data.get("pdf_name", "")
+        self.loaded_saved_at = data.get("saved_at", "")
+        self.loaded_status = data.get("status", "")
+        # Once an invoice has real payment history, only "Add Payment" (here
+        # or from the Home screen) should touch it - editing here and
+        # resaving must never overwrite or collapse the dated payment records.
         self.amount_paid.setReadOnly(document_type == "invoice" and bool(self.current_payments))
         self.amount_paid.setToolTip(
-            "Use \"Record Payment\" from the Home screen to add payments - "
+            "Use the \"+ Add Payment\" button to add payments - "
             "editing this box won't change anything once payments exist."
             if self.current_payments else ""
         )
+        can_add_payment = document_type == "invoice" and loaded_history and self.loaded_status != "VOID"
+        self.add_payment_button.setVisible(can_add_payment)
+        self.save_button.setText("Save Changes" if loaded_history else "Save Draft")
+        if document_type == "invoice" and self.current_payments:
+            paid_total = round(sum(clean_float(p.get("amount")) for p in self.current_payments), 2)
+            lines = [
+                f"{friendly_date(p.get('date'))} — {money(p.get('amount', 0))} received"
+                for p in self.current_payments
+            ]
+            self.payment_summary.setText(
+                "<b>Payments received (" + money(paid_total) + " total):</b><br>" + "<br>".join(lines)
+            )
+            self.payment_summary.setVisible(True)
+        else:
+            self.payment_summary.setVisible(False)
         if data.get("invoice_number"):
             self.number.setText(str(data.get("invoice_number")))
         else:
@@ -1841,6 +1890,71 @@ class EditorPage(QWidget):
     def back_home(self):
         self.save_draft()
         self.window.show_home()
+
+    def save_changes(self):
+        """The plain Save button. For a brand-new/in-progress document this
+        just saves a draft. For an already-generated invoice or estimate
+        it updates the saved record in place - notes, items, discount,
+        whatever changed - without touching the existing PDF file or
+        recorded payments, and without the "want to send it?" prompt that
+        Generate PDF shows."""
+        if not self.loaded_history:
+            data = self.document_data()
+            if not self.has_content(data):
+                QMessageBox.information(self, "Nothing to Save", "Add some details first, then save.")
+                return
+            data["updated_at"] = datetime.today().strftime("%Y/%m/%d %H:%M:%S")
+            drafts = [draft for draft in read_json(DRAFTS_FILE, []) if draft.get("draft_id") != data["draft_id"]]
+            drafts.append(data)
+            write_json(DRAFTS_FILE, sorted(drafts, key=lambda draft: draft.get("updated_at", ""), reverse=True))
+            QMessageBox.information(self, "Draft Saved", "Saved. Pick this back up anytime from the Home screen.")
+            return
+
+        data = self.document_data()
+        data["pdf_path"] = self.loaded_pdf_path
+        data["pdf_name"] = self.loaded_pdf_name
+        data["saved_at"] = self.loaded_saved_at or datetime.today().strftime("%Y/%m/%d %H:%M:%S")
+        if self.document_type == "invoice":
+            if self.loaded_status in {"VOID", "PAST"}:
+                data["status"] = self.loaded_status
+            else:
+                data["status"] = payment_status(data["total"], invoice_paid_total(data))
+        else:
+            data["status"] = self.loaded_status or "SAVED"
+
+        history_file = INVOICE_HISTORY_FILE if self.document_type == "invoice" else ESTIMATE_HISTORY_FILE
+        history = [record for record in read_json(history_file, []) if record.get("invoice_number") != data["invoice_number"]]
+        history.append(data)
+        write_json(history_file, sorted(history, key=document_sort_key, reverse=True))
+        self.save_customer(data)
+        self.loaded_status = data["status"]
+        QMessageBox.information(
+            self,
+            "Changes Saved",
+            "Changes saved.\n\nThe existing PDF file wasn't touched — use \"Generate PDF\" "
+            "if you need a fresh PDF that includes these changes.",
+        )
+
+    def add_payment(self):
+        if self.document_type != "invoice" or not self.loaded_history:
+            return
+        amount_text, ok = QInputDialog.getText(self, "Add Payment", "Payment amount received:")
+        if not ok or not amount_text.strip():
+            return
+        success, result, updated_record = apply_invoice_payment(self.number.text(), amount_text)
+        if not success:
+            QMessageBox.warning(self, "Add Payment", result)
+            return
+        QMessageBox.information(
+            self,
+            "Payment Recorded",
+            f"Payment added: {money(result)} on {friendly_date(today_text())}\n"
+            f"Total: {money(updated_record.get('total', 0))}\n"
+            f"Balance left: {money(updated_record.get('balance_due', 0))}",
+        )
+        # Refresh this same editor screen in place so the updated payment,
+        # balance, and status show up immediately without navigating away.
+        self.load_document("invoice", updated_record, loaded_history=True)
 
     def preview_pdf(self):
         try:
@@ -2378,6 +2492,14 @@ def main():
             border: 1px solid #c7d7e4;
             border-radius: 6px;
             padding: 14px;
+        }
+        QLabel#paymentSummary {
+            background: #eef7f0;
+            border: 1px solid #bfe3c8;
+            border-radius: 6px;
+            padding: 10px 14px;
+            color: #1a4d2e;
+            font-size: 13px;
         }
         QHeaderView::section {
             background: #4b7391;
