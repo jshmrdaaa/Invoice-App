@@ -68,7 +68,7 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.6"
+CURRENT_VERSION = "1.0.7"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -390,6 +390,64 @@ def apply_invoice_payment(invoice_number, amount_text):
     return False, "That invoice could not be found in saved history.", None
 
 
+def edit_invoice_payment(invoice_number, payment_index, new_amount_text):
+    """Corrects the amount of one specific payment already recorded on a
+    saved invoice (e.g. dad typed $10,000 instead of $1,000). Keeps the
+    original date, just fixes the number, and recalculates paid/balance/status
+    the same way apply_invoice_payment does so everything stays in sync.
+    Returns (ok, applied_amount_or_error_message, updated_record_or_None)."""
+    new_amount = round(clean_float(new_amount_text), 2)
+    if new_amount <= 0:
+        return False, "Enter an amount greater than $0.00.", None
+
+    history = read_json(INVOICE_HISTORY_FILE, [])
+    for saved in history:
+        if str(saved.get("invoice_number")) == str(invoice_number):
+            payments = saved.get("payments") or []
+            if not (0 <= payment_index < len(payments)):
+                return False, "That payment could not be found.", None
+            other_total = round(
+                sum(clean_float(p.get("amount")) for i, p in enumerate(payments) if i != payment_index), 2
+            )
+            total = clean_float(saved.get("total", 0))
+            max_allowed = round(max(total - other_total, 0), 2)
+            if max_allowed <= 0:
+                return False, "The other payments already cover the full total, so this one can't be increased.", None
+            applied = min(new_amount, max_allowed)
+            payments[payment_index]["amount"] = applied
+            paid = round(sum(clean_float(p.get("amount")) for p in payments), 2)
+            saved["payments"] = payments
+            saved["amount_paid"] = str(paid)
+            saved["balance_due"] = invoice_balance(saved)
+            saved["status"] = payment_status(saved.get("total", 0), paid)
+            write_json(INVOICE_HISTORY_FILE, history)
+            return True, applied, saved
+
+    return False, "That invoice could not be found in saved history.", None
+
+
+def delete_invoice_payment(invoice_number, payment_index):
+    """Removes one payment entry entirely from a saved invoice (e.g. it got
+    logged twice by mistake) and recalculates paid/balance/status.
+    Returns (ok, message_or_None, updated_record_or_None)."""
+    history = read_json(INVOICE_HISTORY_FILE, [])
+    for saved in history:
+        if str(saved.get("invoice_number")) == str(invoice_number):
+            payments = saved.get("payments") or []
+            if not (0 <= payment_index < len(payments)):
+                return False, "That payment could not be found.", None
+            payments.pop(payment_index)
+            paid = round(sum(clean_float(p.get("amount")) for p in payments), 2)
+            saved["payments"] = payments
+            saved["amount_paid"] = str(paid)
+            saved["balance_due"] = invoice_balance(saved)
+            saved["status"] = payment_status(saved.get("total", 0), paid)
+            write_json(INVOICE_HISTORY_FILE, history)
+            return True, None, saved
+
+    return False, "That invoice could not be found in saved history.", None
+
+
 def extract_customer_from_pdf_text(text):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     email_match = re.search(r"[\w.+-]+@[\w.-]+\.\w+", text)
@@ -459,6 +517,96 @@ def text_issues(value):
                 "right": right,
             })
     return sorted(issues, key=lambda issue: issue["start"])
+
+
+def autocorrected_text(value):
+    """Applies the same typo list used for spell-check underlining and returns
+    the corrected string outright, preserving the capitalization of whatever
+    was typed. Used to auto-fix a whole field's text at once (e.g. when a
+    table cell or line edit loses focus)."""
+    text = str(value or "")
+    issues = text_issues(text)
+    if not issues:
+        return text
+    pieces = []
+    cursor = 0
+    for issue in issues:
+        pieces.append(text[cursor:issue["start"]])
+        fixed = issue["right"]
+        if issue["wrong"][:1].isupper():
+            fixed = fixed[:1].upper() + fixed[1:]
+        pieces.append(fixed)
+        cursor = issue["end"]
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _autocorrect_last_word(text, cursor_pos, boundary_chars=" \t\n"):
+    """If the character right before cursor_pos is a boundary (space/newline)
+    and the word just before that boundary is a known typo, returns
+    (corrected_text, new_cursor_pos). Otherwise returns None. This is what
+    powers "as you type" autocorrect: it only fires the instant a word is
+    finished, the same way autocorrect works on a phone."""
+    if not (0 < cursor_pos <= len(text)):
+        return None
+    if text[cursor_pos - 1] not in boundary_chars:
+        return None
+    start = cursor_pos - 1
+    while start > 0 and text[start - 1] not in boundary_chars:
+        start -= 1
+    word = text[start:cursor_pos - 1]
+    if not word:
+        return None
+    fixed = COMMON_TEXT_FIXES.get(word.lower())
+    if not fixed or fixed.lower() == word.lower():
+        return None
+    if word[:1].isupper():
+        fixed = fixed[:1].upper() + fixed[1:]
+    new_text = text[:start] + fixed + text[cursor_pos - 1:]
+    new_cursor = start + len(fixed) + 1
+    return new_text, new_cursor
+
+
+def autocorrect_line_edit(field):
+    """Wire this to a QLineEdit's textChanged signal to autocorrect the word
+    the user just finished typing (as soon as they hit space)."""
+    text = field.text()
+    result = _autocorrect_last_word(text, field.cursorPosition())
+    if not result:
+        return
+    new_text, new_pos = result
+    field.blockSignals(True)
+    field.setText(new_text)
+    field.setCursorPosition(new_pos)
+    field.blockSignals(False)
+
+
+def autocorrect_line_edit_on_finish(field):
+    """Wire this to a QLineEdit's editingFinished signal as a safety net that
+    catches the last word of a field even if the user never typed a trailing
+    space (e.g. they tabbed away immediately)."""
+    text = field.text()
+    fixed = autocorrected_text(text)
+    if fixed != text:
+        field.blockSignals(True)
+        field.setText(fixed)
+        field.blockSignals(False)
+
+
+def autocorrect_text_edit(field):
+    """Wire this to a QTextEdit's textChanged signal for the same as-you-type
+    behavior as autocorrect_line_edit."""
+    text = field.toPlainText()
+    result = _autocorrect_last_word(text, field.textCursor().position())
+    if not result:
+        return
+    new_text, new_pos = result
+    field.blockSignals(True)
+    field.setPlainText(new_text)
+    cursor = field.textCursor()
+    cursor.setPosition(new_pos)
+    field.setTextCursor(cursor)
+    field.blockSignals(False)
 
 
 class HomePage(QWidget):
@@ -540,9 +688,11 @@ class HomePage(QWidget):
         self.invoice_history.itemClicked.connect(self.select_invoice_history)
         self.estimate_history.itemClicked.connect(lambda _item: self.mark_history_selection("estimate"))
 
-        tabs = QTabWidget()
-        tabs.setObjectName("homeTabs")
-        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.content_stack = QStackedWidget()
+        self.nav_list = QListWidget()
+        self.nav_list.setObjectName("sidebarNav")
+        self.nav_list.addItems(["Drafts", "Customers", "Invoices", "Estimates", "Settings"])
+        self.nav_list.currentRowChanged.connect(self.content_stack.setCurrentIndex)
 
         drafts_tab = QWidget()
         drafts_layout = QVBoxLayout(drafts_tab)
@@ -592,6 +742,9 @@ class HomePage(QWidget):
         customer_edit_form.addRow("Email", self.edit_customer_email)
         customer_edit_form.addRow("Address", self.edit_customer_address)
         customer_edit_form.addRow("City / State / ZIP", self.edit_customer_city_state_zip)
+        for field in (self.edit_customer_name, self.edit_customer_address, self.edit_customer_city_state_zip):
+            field.textChanged.connect(lambda _, f=field: autocorrect_line_edit(f))
+            field.editingFinished.connect(lambda f=field: autocorrect_line_edit_on_finish(f))
         customer_box.addLayout(customer_edit_form)
         customer_actions = QHBoxLayout()
         customer_actions.setSpacing(10)
@@ -649,6 +802,19 @@ class HomePage(QWidget):
         self.payment_history.setMaximumHeight(150)
         self.payment_history.setPlaceholderText("Select an invoice to see payment history.")
         invoices_layout.addWidget(self.payment_history)
+        payment_fix_row = QHBoxLayout()
+        payment_fix_row.setSpacing(10)
+        self.payment_select = QComboBox()
+        self.payment_select.addItem("Fix a past payment...", None)
+        edit_payment = QPushButton("Edit Selected Payment")
+        delete_payment = QPushButton("Delete Selected Payment")
+        delete_payment.setObjectName("dangerButton")
+        edit_payment.clicked.connect(self.edit_selected_payment)
+        delete_payment.clicked.connect(self.delete_selected_payment)
+        payment_fix_row.addWidget(self.payment_select, 2)
+        payment_fix_row.addWidget(edit_payment)
+        payment_fix_row.addWidget(delete_payment)
+        invoices_layout.addLayout(payment_fix_row)
         payment_row = QHBoxLayout()
         payment_row.setSpacing(10)
         self.payment_amount = QLineEdit()
@@ -745,6 +911,10 @@ class HomePage(QWidget):
         settings_form.addRow("Email", self.company_email)
         settings_form.addRow("Address", self.company_address)
         settings_form.addRow("Default Notes", self.default_notes)
+        for field in (self.company_name, self.owner_name, self.company_address):
+            field.textChanged.connect(lambda _, f=field: autocorrect_line_edit(f))
+            field.editingFinished.connect(lambda f=field: autocorrect_line_edit_on_finish(f))
+        self.default_notes.textChanged.connect(lambda: autocorrect_text_edit(self.default_notes))
         settings_layout.addLayout(settings_form)
         self.logo_status = QLabel()
         self.logo_status.setObjectName("mutedText")
@@ -762,21 +932,31 @@ class HomePage(QWidget):
         settings_layout.addLayout(settings_actions)
         settings_layout.addStretch(1)
 
-        tabs.addTab(drafts_tab, "Drafts")
-        tabs.addTab(customers_tab, "Customers")
-        tabs.addTab(invoices_tab, "Invoices")
-        tabs.addTab(estimates_tab, "Estimates")
-        tabs.addTab(settings_tab, "Settings")
-        layout.addWidget(tabs, 1)
+        self.content_stack.addWidget(drafts_tab)
+        self.content_stack.addWidget(customers_tab)
+        self.content_stack.addWidget(invoices_tab)
+        self.content_stack.addWidget(estimates_tab)
+        self.content_stack.addWidget(settings_tab)
 
-        bottom = QHBoxLayout()
-        bottom.setSpacing(10)
+        sidebar_widget = QWidget()
+        sidebar_widget.setObjectName("sidebarPanel")
+        sidebar_widget.setFixedWidth(200)
+        sidebar_layout = QVBoxLayout(sidebar_widget)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(12)
+        sidebar_layout.addWidget(self.nav_list, 1)
         backup = QPushButton("Backup Data")
         backup.setObjectName("primaryButton")
         backup.clicked.connect(self.create_backup)
-        bottom.addStretch(1)
-        bottom.addWidget(backup)
-        layout.addLayout(bottom)
+        sidebar_layout.addWidget(backup)
+
+        body = QHBoxLayout()
+        body.setSpacing(18)
+        body.addWidget(sidebar_widget)
+        body.addWidget(self.content_stack, 1)
+        layout.addLayout(body, 1)
+
+        self.nav_list.setCurrentRow(0)
 
     def section_title(self, text):
         label = QLabel(text)
@@ -1004,8 +1184,12 @@ class HomePage(QWidget):
         if not hasattr(self, "payment_history"):
             return
         record = self.selected_item_data(self.invoice_history)
+        self.payment_select.blockSignals(True)
+        self.payment_select.clear()
         if not record:
             self.payment_history.setPlainText("Select an invoice to see payment history.")
+            self.payment_select.addItem("Fix a past payment...", None)
+            self.payment_select.blockSignals(False)
             return
         payments = record.get("payments") or []
         lines = [
@@ -1019,8 +1203,14 @@ class HomePage(QWidget):
         if payments:
             for index, payment in enumerate(payments, start=1):
                 lines.append(f"{index}. {friendly_date(payment.get('date'))} - {money(payment.get('amount', 0))}")
+            self.payment_select.addItem("Fix a past payment...", None)
+            for index, payment in enumerate(payments):
+                label = f"{friendly_date(payment.get('date'))} - {money(payment.get('amount', 0))}"
+                self.payment_select.addItem(label, index)
         else:
             lines.append("No payments recorded yet.")
+            self.payment_select.addItem("No payments recorded yet", None)
+        self.payment_select.blockSignals(False)
         self.payment_history.setPlainText("\n".join(lines))
 
     def open_selected_draft(self):
@@ -1265,6 +1455,70 @@ class HomePage(QWidget):
             f"Balance left: {money(updated_record.get('balance_due', 0))}",
         )
 
+    def edit_selected_payment(self):
+        record = self.selected_history_record("invoice")
+        if not record:
+            QMessageBox.information(self, "Edit Payment", "Select a saved invoice first.")
+            return
+        index = self.payment_select.currentData()
+        if index is None:
+            QMessageBox.information(self, "Edit Payment", "Pick a payment from the dropdown first.")
+            return
+        payments = record.get("payments") or []
+        if not (0 <= index < len(payments)):
+            return
+        current_amount = money(payments[index].get("amount", 0))
+        new_amount, ok = QInputDialog.getText(
+            self,
+            "Edit Payment",
+            f"Payment from {friendly_date(payments[index].get('date'))} is currently {current_amount}.\n"
+            f"Enter the corrected amount:",
+        )
+        if not ok or not new_amount.strip():
+            return
+        success, result, updated_record = edit_invoice_payment(record.get("invoice_number"), index, new_amount)
+        if not success:
+            QMessageBox.warning(self, "Edit Payment", result)
+            return
+        self.refresh()
+        self.update_payment_history()
+        QMessageBox.information(
+            self,
+            "Payment Updated",
+            f"Payment corrected to {money(result)}.\n"
+            f"Total: {money(updated_record.get('total', 0))}\n"
+            f"Balance left: {money(updated_record.get('balance_due', 0))}",
+        )
+
+    def delete_selected_payment(self):
+        record = self.selected_history_record("invoice")
+        if not record:
+            QMessageBox.information(self, "Delete Payment", "Select a saved invoice first.")
+            return
+        index = self.payment_select.currentData()
+        if index is None:
+            QMessageBox.information(self, "Delete Payment", "Pick a payment from the dropdown first.")
+            return
+        payments = record.get("payments") or []
+        if not (0 <= index < len(payments)):
+            return
+        label = f"{friendly_date(payments[index].get('date'))} - {money(payments[index].get('amount', 0))}"
+        answer = QMessageBox.question(
+            self,
+            "Delete Payment",
+            f"Remove this payment entirely?\n\n{label}\n\nThis can't be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        success, message, updated_record = delete_invoice_payment(record.get("invoice_number"), index)
+        if not success:
+            QMessageBox.warning(self, "Delete Payment", message)
+            return
+        self.refresh()
+        self.update_payment_history()
+
     def open_history(self, document_type):
         record = self.selected_item_data(self.invoice_history if document_type == "invoice" else self.estimate_history)
         if record:
@@ -1497,6 +1751,9 @@ class EditorPage(QWidget):
         form_grid.addWidget(QLabel("Project Name"), 6, 0)
         form_grid.addWidget(self.project_name, 6, 1, 1, 3)
         layout.addLayout(form_grid)
+        for field in (self.customer_name, self.customer_address, self.customer_city_state_zip, self.project_name):
+            field.textChanged.connect(lambda _, f=field: autocorrect_line_edit(f))
+            field.editingFinished.connect(lambda f=field: autocorrect_line_edit_on_finish(f))
 
         self.payment_summary = QLabel()
         self.payment_summary.setObjectName("paymentSummary")
@@ -1540,6 +1797,7 @@ class EditorPage(QWidget):
         self.notes = QTextEdit()
         self.notes.setPlaceholderText("Notes, payment terms, job details, warranty info...")
         self.notes.setMinimumHeight(150)
+        self.notes.textChanged.connect(lambda: autocorrect_text_edit(self.notes))
         self.notes.textChanged.connect(self.mark_notes_spelling)
         bottom.addWidget(self.notes, 2)
 
@@ -1645,8 +1903,7 @@ class EditorPage(QWidget):
         self.customer_address.setText(str(data.get("customer_address_small", "")))
         self.customer_city_state_zip.setText(str(data.get("customer_city_state_zip", "")))
         self.project_name.setText(str(data.get("project_name", "")))
-        default_notes = get_settings().get("default_notes", "")
-        self.notes.setPlainText(str(data.get("notes", default_notes)))
+        self.notes.setPlainText(str(data.get("notes", "")))
         self.additional.setText(str(data.get("additional_subtotal", "")))
         self.discount.setText(str(data.get("discount", "")))
         self.amount_paid.setText(str(data.get("amount_paid", "")))
@@ -1739,6 +1996,12 @@ class EditorPage(QWidget):
             row = item.row() if item else -1
         except RuntimeError:
             return
+        if column in (0, 1):
+            fixed = autocorrected_text(item.text())
+            if fixed != item.text():
+                self.items.blockSignals(True)
+                item.setText(fixed)
+                self.items.blockSignals(False)
         self.recalculate()
         if column in (0, 1):
             self.mark_item_spelling(row, column)
@@ -2073,42 +2336,38 @@ class EditorPage(QWidget):
         write_json(DRAFTS_FILE, drafts)
 
     def create_pdf(self, data, preview=False):
-        document_title = "ESTIMATE" if self.document_type == "estimate" else "INVOICE"
+        document_title = "Estimate" if self.document_type == "estimate" else "Invoice"
         document_label = "Estimate" if self.document_type == "estimate" else "Invoice"
-        recipient_label = "Estimate For" if self.document_type == "estimate" else "Invoice To"
-        additional_label = "Other Charges"
+        recipient_label = "Customer"
         settings = get_settings()
-        footer_parts = [
-            settings.get("company_name", ""),
-            settings.get("owner_name", ""),
-            settings.get("phone", ""),
-            settings.get("email", ""),
-            settings.get("address", ""),
-            settings.get("default_notes", ""),
-        ]
-        footer_html = "<br>".join(html.escape(part) for part in footer_parts if part)
         current_logo_path = logo_path()
         if current_logo_path and os.path.exists(current_logo_path):
-            logo_html = f'<img src="{image_to_data_uri(current_logo_path)}" width="205">'
+            logo_html = f'<img src="{image_to_data_uri(current_logo_path)}" width="160">'
         else:
-            logo_html = '<div style="font-size:24px; font-weight:bold; color:#4b7391;">ADAEL<br>CONSTRUCTION</div>'
+            logo_html = '<div style="font-size:15px; font-weight:700; color:#22394a; letter-spacing:0.5px;">ADAEL<br>CONSTRUCTION</div>'
+
         rows = ""
         for index, item in enumerate(data["items"], start=1):
             qty = clean_float(item.get("qty", "")) or (1 if clean_float(item.get("price", "")) else 0)
             price = clean_float(item.get("price", ""))
             title = item.get("title", "").strip()
             description = item.get("description", "").strip()
+            description_html = html.escape(description).replace("\n", "<br>")
             if title and description:
-                item_html = f'<strong>{html.escape(title)}</strong><br><span style="font-size:12px; color:#555;">{html.escape(description)}</span>'
+                item_html = f'<div class="item-title">{html.escape(title)}</div><div class="party-line">{description_html}</div>'
+            elif title:
+                item_html = f'<div class="item-title">{html.escape(title)}</div>'
+            elif description:
+                item_html = f'<div class="item-title">{description_html}</div>'
             else:
-                item_html = f'<strong>{html.escape(title or description)}</strong>'
+                item_html = ""
             rows += f"""
             <tr>
-                <td>{index}</td>
+                <td class="num-col">{index}</td>
                 <td>{item_html}</td>
-                <td>{format_qty(qty)}</td>
-                <td>{money(price)}</td>
-                <td>{money(qty * price)}</td>
+                <td class="qty-col">{format_qty(qty)}</td>
+                <td class="price-col">{money(price)}</td>
+                <td class="price-col">{money(qty * price)}</td>
             </tr>
             """
 
@@ -2116,112 +2375,128 @@ class EditorPage(QWidget):
         discount_amount = resolve_discount(discount_text_raw, data.get("subtotal", 0))
         discount_label = f"Discount ({discount_text_raw})" if discount_text_raw.endswith("%") else "Discount"
         discount_html = (
-            f'<div><strong>{discount_label}:</strong> -{money(discount_amount)}</div>' if discount_amount else ""
+            f'<div class="totals-line"><span>{discount_label}</span><span>-{money(discount_amount)}</span></div>'
+            if discount_amount else ""
         )
 
-        payment_html = ""
-        if self.document_type == "invoice":
-            payments_list = data.get("payments") or []
-            payment_log_html = ""
-            if payments_list:
-                payment_log_html = "<div style=\"margin-top:6px;\">"
-                for entry in payments_list:
-                    payment_log_html += (
-                        f'<div style="font-size:13px; color:#3f627c;">'
-                        f'{html.escape(friendly_date(entry.get("date")))} &mdash; '
-                        f'{money(entry.get("amount", 0))} received</div>'
-                    )
-                payment_log_html += "</div>"
-            payment_html = f"""
-            <div><strong>Amount Paid:</strong> {money(data["amount_paid"])}</div>
-            {payment_log_html}
-            <div><strong>Balance Due:</strong> {money(data["balance_due"])}</div>
-            """
+        # Amount Paid / Other Charges / Balance Due / Subtotal are for Thiago's
+        # dad's own tracking inside the app only -- intentionally left off the
+        # printed PDF so customers only ever see the Discount (if any) and Total.
 
-        signature_block = ""
-        if self.document_type == "estimate":
-            signature_block = """
-            <div style="margin-top:36px; border-top: 1px solid #ccc; padding-top: 18px;">
-                <table style="width:100%; font-size:13px; color:#444;">
-                    <tr>
-                        <td style="width:48%; padding-right:16px;">
-                            <div style="border-bottom:1px solid #333; height:38px; margin-bottom:6px;"></div>
-                            <div><strong>Customer Signature</strong></div>
-                        </td>
-                        <td style="width:4%;"></td>
-                        <td style="width:48%;">
-                            <div style="border-bottom:1px solid #333; height:38px; margin-bottom:6px;"></div>
-                            <div><strong>Date</strong></div>
-                        </td>
-                    </tr>
-                </table>
-                <div style="margin-top:10px; font-size:11px; color:#666; text-align:center; font-style:italic;">
-                    By signing this document the customer agrees to the services and conditions outlined in this document.
-                </div>
-            </div>"""
+        project_row = ""
+        if data.get("project_name", "").strip():
+            project_row = f"""<div class="meta-row"><div class="meta-label">Project</div><div class="meta-value">{html.escape(data.get("project_name", ""))}</div></div>"""
+
+        provider_lines = "".join(
+            f'<div class="party-line">{html.escape(part)}</div>'
+            for part in [settings.get("phone", ""), settings.get("email", "")]
+            if part
+        )
+        customer_lines = "".join(
+            f'<div class="party-line">{html.escape(part)}</div>'
+            for part in [
+                data["customer_phone_small"],
+                data["customer_email_small"],
+                data["customer_address_small"],
+                data["customer_city_state_zip"],
+            ]
+            if part
+        )
+
+        notes_stripped = str(data.get("notes", "")).strip()
+        notes_html = html.escape(notes_stripped).replace("\n", "<br>")
+        notes_cell_html = (
+            f'<div class="label-caps">Notes</div><div class="notes-text">{notes_html}</div>' if notes_stripped else ""
+        )
+
+        footer_html = " &nbsp;&middot;&nbsp; ".join(
+            html.escape(part) for part in [settings.get("owner_name", ""), settings.get("phone", ""), settings.get("email", "")] if part
+        )
 
         pdf_html = f"""
         <html>
         <head>
+        <meta charset="UTF-8">
         <style>
-            body {{ font-family: "Segoe UI", Arial, sans-serif; padding: 24px 34px; color: #222; }}
-            .top {{ display: table; width: 100%; height: 126px; margin-bottom: 22px; }}
-            .logo {{ display: table-cell; width: 245px; vertical-align: middle; }}
-            .title {{ display: table-cell; vertical-align: middle; background: {BRAND_BLUE}; color: white; text-align: right; padding-right: 24px; }}
-            .title h1 {{ font-size: 34px; margin: 0 0 10px; }}
-            .title p {{ font-size: 18px; margin: 0; line-height: 1.55; }}
-            .section-label {{ color: {BRAND_BLUE}; font-size: 16px; font-weight: bold; }}
-            .customer-name {{ font-size: 22px; font-weight: bold; margin: 7px 0; }}
-            .customer-details {{ font-size: 18px; line-height: 1.6; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 18px; }}
-            th {{ background: {BRAND_BLUE}; color: white; padding: 8px; }}
-            td {{ border: 1px solid #c7d7e4; padding: 8px; }}
-            tr:nth-child(odd) td {{ background: #e8f1f7; }}
-            .summary {{ display: table; width: 100%; margin-top: 24px; }}
-            .notes {{ display: table-cell; width: 58%; border: 1px solid #c7d7e4; background: #f7fafc; padding: 12px; min-height: 70px; font-size: 16px; vertical-align: top; }}
-            .summary-spacer {{ display: table-cell; width: 24px; }}
-            .totals {{ display: table-cell; width: 320px; border: 1px solid #c7d7e4; font-size: 14px; vertical-align: top; }}
-            .totals-lines {{ padding: 10px 14px; line-height: 1.55; }}
-            .total-bar {{ background: {BRAND_BLUE}; color: white; display: flex; justify-content: space-between; padding: 10px 14px; font-size: 16px; font-weight: bold; }}
-            .footer {{ margin-top: 28px; text-align: center; font-size: 12px; line-height: 1.35; }}
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: "Segoe UI", Arial, sans-serif; padding: 40px 44px; color: #2b2f33; font-size: 12.5px; }}
+            .label-caps {{ font-size: 10px; letter-spacing: 1.4px; text-transform: uppercase; color: {BRAND_BLUE}; font-weight: 700; margin-bottom: 7px; }}
+            .header-row {{ display: table; width: 100%; margin-bottom: 8px; }}
+            .header-left {{ display: table-cell; width: 42%; vertical-align: top; }}
+            .header-right {{ display: table-cell; width: 58%; vertical-align: top; text-align: right; }}
+            .party-name {{ font-size: 14px; font-weight: 700; color: #22394a; margin-bottom: 3px; }}
+            .party-line {{ font-size: 12px; color: #5c6570; line-height: 1.55; }}
+            .party-block {{ margin-bottom: 18px; }}
+            .from-block {{ margin-top: 6px; }}
+            .from-block .party-name {{ font-size: 12px; }}
+            .from-block .party-line {{ font-size: 10.5px; }}
+            .meta-block {{ margin-top: 22px; }}
+            .meta-row {{ display: table; margin-left: auto; margin-bottom: 6px; }}
+            .meta-label {{ display: table-cell; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: {BRAND_BLUE}; text-align: left; padding-right: 14px; white-space: nowrap; }}
+            .meta-value {{ display: table-cell; font-size: 12.5px; font-weight: 600; color: #22394a; text-align: right; white-space: nowrap; }}
+            .doc-title {{ text-align: center; font-size: 26px; font-weight: 300; letter-spacing: 8px; text-transform: uppercase; color: {BRAND_BLUE}; margin: 30px 0 26px; }}
+            table.items {{ width: 100%; border-collapse: collapse; }}
+            table.items th {{ text-align: left; font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase; color: #ffffff; font-weight: 700; padding: 10px 8px; background: {BRAND_BLUE}; }}
+            table.items th:first-child {{ border-top-left-radius: 4px; border-bottom-left-radius: 4px; }}
+            table.items th:last-child {{ border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
+            table.items td {{ padding: 11px 8px; border-bottom: 1px solid #eef0f3; font-size: 12.5px; color: #333; vertical-align: top; }}
+            table.items tr:nth-child(even) td {{ background: #eaf2f8; }}
+            .item-title {{ font-weight: 700; color: #22394a; }}
+            .num-col {{ width: 30px; color: #7a92a3; }}
+            .qty-col {{ width: 60px; text-align: center; }}
+            .price-col {{ width: 100px; text-align: right; }}
+            table.items th.qty-col {{ text-align: center; }}
+            table.items th.price-col {{ text-align: right; }}
+            .summary-row {{ display: table; width: 100%; margin-top: 26px; }}
+            .notes-cell {{ display: table-cell; width: 55%; vertical-align: top; padding-right: 30px; }}
+            .notes-text {{ font-size: 12px; color: #5c6570; line-height: 1.6; }}
+            .totals-cell {{ display: table-cell; width: 45%; vertical-align: top; }}
+            .totals-line {{ display: table; width: 100%; padding: 5px 0; font-size: 12.5px; color: #5c6570; }}
+            .totals-line span {{ display: table-cell; }}
+            .totals-line span:last-child {{ text-align: right; color: #22394a; font-weight: 600; }}
+            .total-final {{ display: table; width: 100%; margin-top: 10px; padding: 10px 12px; background: {BRAND_BLUE}; border-radius: 4px; font-size: 15px; font-weight: 700; color: #ffffff; }}
+            .total-final span {{ display: table-cell; }}
+            .total-final span:last-child {{ text-align: right; }}
+            .footer {{ margin-top: 44px; padding-top: 16px; border-top: 1px solid #eef0f3; text-align: center; font-size: 10.5px; color: #9aa1a9; line-height: 1.7; }}
+            .watermark {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-32deg); white-space: nowrap; font-size: 190px; font-weight: 800; letter-spacing: 16px; color: {BRAND_BLUE}; opacity: 0.08; z-index: 0; }}
         </style>
         </head>
         <body>
-            <div class="top">
-                <div class="logo">{logo_html}</div>
-                <div class="title">
-                    <h1>{document_title}</h1>
-                    <p><strong>{document_label} No:</strong> {html.escape(data["invoice_number"])}<br>
-                    <strong>Date:</strong> {html.escape(data["invoice_date"])}{('<br><strong>Project:</strong> ' + html.escape(data.get('project_name', ''))) if data.get('project_name', '').strip() else ''}</p>
+            {'<div class="watermark">ESTIMATE</div>' if self.document_type == "estimate" else ""}
+            <div class="header-row">
+                <div class="header-left">
+                    {logo_html}
+                    <div class="party-block from-block">
+                        <div class="party-name">{html.escape(settings.get("company_name", ""))}</div>
+                        {provider_lines}
+                    </div>
+                </div>
+                <div class="header-right">
+                    <div class="meta-block">
+                        <div class="meta-row"><div class="meta-label">{document_label} No</div><div class="meta-value">{html.escape(data["invoice_number"])}</div></div>
+                        <div class="meta-row"><div class="meta-label">Date</div><div class="meta-value">{html.escape(data["invoice_date"])}</div></div>
+                        {project_row}
+                    </div>
                 </div>
             </div>
-            <div class="section-label">{recipient_label}:</div>
-            <div class="customer-name">{html.escape(data["customer_name_big"] or "Customer Name")}</div>
-            <div class="customer-details">
-                <div>{html.escape(data["customer_phone_small"])}</div>
-                <div>{html.escape(data["customer_email_small"])}</div>
-                <div>{html.escape(data["customer_address_small"])}</div>
-                <div>{html.escape(data["customer_city_state_zip"])}</div>
+            <div class="party-block" style="margin-top:24px;">
+                <div class="label-caps">{recipient_label}</div>
+                <div class="party-name">{html.escape(data["customer_name_big"] or "Customer Name")}</div>
+                {customer_lines}
             </div>
-            <table>
-                <tr><th>NO</th><th>DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th>AMOUNT</th></tr>
+            <div class="doc-title">{document_title}</div>
+            <table class="items">
+                <tr><th class="num-col">No</th><th>Description</th><th class="qty-col">Qty</th><th class="price-col">Unit Price</th><th class="price-col">Amount</th></tr>
                 {rows}
             </table>
-            <div class="summary">
-                <div class="notes"><div class="section-label">Notes:</div>{html.escape(data["notes"])}</div>
-                <div class="summary-spacer"></div>
-                <div class="totals">
-                    <div class="totals-lines">
-                        <div><strong>Subtotal:</strong> {money(data["subtotal"])}</div>
-                        {discount_html}
-                        <div><strong>{additional_label}:</strong> {money(data["additional_subtotal"])}</div>
-                        {payment_html}
-                    </div>
-                    <div class="total-bar"><span>TOTAL</span><span>{money(data["total"])}</span></div>
+            <div class="summary-row">
+                <div class="notes-cell">{notes_cell_html}</div>
+                <div class="totals-cell">
+                    {discount_html}
+                    <div class="total-final"><span>Total</span><span>{money(data["total"])}</span></div>
                 </div>
             </div>
             <div class="footer">{footer_html}</div>
-            {signature_block}
         </body>
         </html>
         """
@@ -2458,6 +2733,30 @@ def main():
         }
         QListWidget#panelList {
             padding: 6px;
+        }
+        QWidget#sidebarPanel {
+            background: transparent;
+        }
+        QListWidget#sidebarNav {
+            background: #ffffff;
+            border: 1px solid #c7d7e4;
+            border-radius: 8px;
+            padding: 8px;
+            font-size: 14px;
+        }
+        QListWidget#sidebarNav::item {
+            padding: 12px 14px;
+            border-radius: 6px;
+            margin-bottom: 4px;
+            font-weight: 600;
+            color: #31536d;
+        }
+        QListWidget#sidebarNav::item:selected {
+            background: #4b7391;
+            color: #ffffff;
+        }
+        QListWidget#sidebarNav::item:hover:!selected {
+            background: #eef4f8;
         }
         QListWidget::item {
             padding: 8px;
