@@ -68,7 +68,7 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.9"
+CURRENT_VERSION = "1.0.10"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -1118,6 +1118,10 @@ class HomePage(QWidget):
                     cell.setForeground(QColor("#9b1c1c"))
                 elif status == "PAID":
                     cell.setForeground(QColor("#1a7f43"))
+                elif status == "PARTIAL":
+                    cell.setForeground(QColor("#b45309"))
+                elif status == "UNPAID":
+                    cell.setForeground(QColor("#c22626"))
                 self.invoice_history.setItem(row, column, cell)
         self.update_payment_history()
         self.update_invoice_stats()
