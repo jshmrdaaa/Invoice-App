@@ -71,7 +71,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.13"
+CURRENT_VERSION = "1.0.14"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2671,11 +2671,34 @@ def download_and_relaunch(download_url):
         log_update_event(f"Download failed - {type(error).__name__}: {error}")
         return False
 
+    # Windows Defender (and other antivirus) commonly grabs a brief lock on a
+    # freshly-downloaded exe to scan it, which makes an immediate "move" fail.
+    # This retries a few times with short waits instead of giving up on the
+    # first try, and logs every step so a failure here is actually visible
+    # instead of just silently leaving the old version in place.
     bat_contents = (
         "@echo off\r\n"
-        "timeout /t 2 /nobreak >nul\r\n"
-        f'move /Y "{new_exe_path}" "{current_exe}"\r\n'
+        f'set LOGFILE="{UPDATE_LOG_FILE}"\r\n'
+        f'echo %date% %time% - Updater started, waiting for the app to fully close... >> %LOGFILE%\r\n'
+        "timeout /t 3 /nobreak >nul\r\n"
+        "set ATTEMPTS=0\r\n"
+        ":retry\r\n"
+        "set /a ATTEMPTS+=1\r\n"
+        f'move /Y "{new_exe_path}" "{current_exe}" >nul 2>&1\r\n'
+        "if errorlevel 1 (\r\n"
+        '  echo %date% %time% - Move attempt %ATTEMPTS% failed - file may still be locked. >> %LOGFILE%\r\n'
+        "  if %ATTEMPTS% LSS 6 (\r\n"
+        "    timeout /t 2 /nobreak >nul\r\n"
+        "    goto retry\r\n"
+        "  )\r\n"
+        '  echo %date% %time% - Gave up after 6 attempts - keeping the old version and relaunching it. >> %LOGFILE%\r\n'
+        f'  start "" "{current_exe}"\r\n'
+        '  del "%~f0"\r\n'
+        "  exit /b\r\n"
+        ")\r\n"
+        'echo %date% %time% - File swap succeeded on attempt %ATTEMPTS%. >> %LOGFILE%\r\n'
         f'start "" "{current_exe}"\r\n'
+        'echo %date% %time% - Relaunch command issued. >> %LOGFILE%\r\n'
         'del "%~f0"\r\n'
     )
     try:
