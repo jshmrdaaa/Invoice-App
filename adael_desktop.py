@@ -68,7 +68,7 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.7"
+CURRENT_VERSION = "1.0.8"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -341,6 +341,19 @@ def payment_status(total, amount_paid):
     if paid > 0:
         return "PARTIAL"
     return "UNPAID"
+
+
+def friendly_payment_status(status):
+    """Turns the internal status code into the plain phrase dad sees in
+    confirmation popups, so it's immediately obvious whether an invoice is
+    settled or still owes money."""
+    return {
+        "PAID": "Paid in full",
+        "PARTIAL": "Partially paid - balance still due",
+        "UNPAID": "Unpaid",
+        "SAVED": "No amount due",
+        "VOID": "Void",
+    }.get(status, status)
 
 
 def invoice_paid_total(record):
@@ -802,6 +815,10 @@ class HomePage(QWidget):
         self.payment_history.setMaximumHeight(150)
         self.payment_history.setPlaceholderText("Select an invoice to see payment history.")
         invoices_layout.addWidget(self.payment_history)
+
+        fix_label = QLabel("Made a mistake? Fix a payment already on the list above:")
+        fix_label.setObjectName("mutedText")
+        invoices_layout.addWidget(fix_label)
         payment_fix_row = QHBoxLayout()
         payment_fix_row.setSpacing(10)
         self.payment_select = QComboBox()
@@ -815,11 +832,15 @@ class HomePage(QWidget):
         payment_fix_row.addWidget(edit_payment)
         payment_fix_row.addWidget(delete_payment)
         invoices_layout.addLayout(payment_fix_row)
+
+        new_payment_label = QLabel("Received a new payment? Add it here:")
+        new_payment_label.setObjectName("mutedText")
+        invoices_layout.addWidget(new_payment_label)
         payment_row = QHBoxLayout()
         payment_row.setSpacing(10)
         self.payment_amount = QLineEdit()
-        self.payment_amount.setPlaceholderText("Payment amount")
-        record_payment = QPushButton("Record Payment")
+        self.payment_amount.setPlaceholderText("New payment amount")
+        record_payment = QPushButton("Add New Payment")
         record_payment.setObjectName("primaryButton")
         record_payment.clicked.connect(self.record_invoice_payment)
         payment_row.addWidget(self.payment_amount)
@@ -1438,11 +1459,11 @@ class HomePage(QWidget):
     def record_invoice_payment(self):
         record = self.selected_history_record("invoice")
         if not record:
-            QMessageBox.information(self, "Record Payment", "Select a saved invoice first.")
+            QMessageBox.information(self, "Add New Payment", "Select a saved invoice first.")
             return
         ok, result, updated_record = apply_invoice_payment(record.get("invoice_number"), self.payment_amount.text())
         if not ok:
-            QMessageBox.warning(self, "Record Payment", result)
+            QMessageBox.warning(self, "Add New Payment", result)
             return
         self.payment_amount.clear()
         self.refresh()
@@ -1452,15 +1473,19 @@ class HomePage(QWidget):
             "Payment Recorded",
             f"Payment added: {money(result)} on {friendly_date(today_text())}\n"
             f"Total: {money(updated_record.get('total', 0))}\n"
-            f"Balance left: {money(updated_record.get('balance_due', 0))}",
+            f"Balance left: {money(updated_record.get('balance_due', 0))}\n"
+            f"Status: {friendly_payment_status(updated_record.get('status'))}",
         )
 
     def edit_selected_payment(self):
-        record = self.selected_history_record("invoice")
+        # Read the dropdown's selection BEFORE touching anything else -
+        # selected_history_record() re-populates this same dropdown as a
+        # side effect, which would wipe out the selection we're about to read.
+        index = self.payment_select.currentData()
+        record = self.selected_item_data(self.invoice_history)
         if not record:
             QMessageBox.information(self, "Edit Payment", "Select a saved invoice first.")
             return
-        index = self.payment_select.currentData()
         if index is None:
             QMessageBox.information(self, "Edit Payment", "Pick a payment from the dropdown first.")
             return
@@ -1487,15 +1512,17 @@ class HomePage(QWidget):
             "Payment Updated",
             f"Payment corrected to {money(result)}.\n"
             f"Total: {money(updated_record.get('total', 0))}\n"
-            f"Balance left: {money(updated_record.get('balance_due', 0))}",
+            f"Balance left: {money(updated_record.get('balance_due', 0))}\n"
+            f"Status: {friendly_payment_status(updated_record.get('status'))}",
         )
 
     def delete_selected_payment(self):
-        record = self.selected_history_record("invoice")
+        # Same ordering fix as edit_selected_payment: read the dropdown first.
+        index = self.payment_select.currentData()
+        record = self.selected_item_data(self.invoice_history)
         if not record:
             QMessageBox.information(self, "Delete Payment", "Select a saved invoice first.")
             return
-        index = self.payment_select.currentData()
         if index is None:
             QMessageBox.information(self, "Delete Payment", "Pick a payment from the dropdown first.")
             return
@@ -1518,6 +1545,13 @@ class HomePage(QWidget):
             return
         self.refresh()
         self.update_payment_history()
+        QMessageBox.information(
+            self,
+            "Payment Deleted",
+            f"Total: {money(updated_record.get('total', 0))}\n"
+            f"Balance left: {money(updated_record.get('balance_due', 0))}\n"
+            f"Status: {friendly_payment_status(updated_record.get('status'))}",
+        )
 
     def open_history(self, document_type):
         record = self.selected_item_data(self.invoice_history if document_type == "invoice" else self.estimate_history)
@@ -2213,7 +2247,8 @@ class EditorPage(QWidget):
             "Payment Recorded",
             f"Payment added: {money(result)} on {friendly_date(today_text())}\n"
             f"Total: {money(updated_record.get('total', 0))}\n"
-            f"Balance left: {money(updated_record.get('balance_due', 0))}",
+            f"Balance left: {money(updated_record.get('balance_due', 0))}\n"
+            f"Status: {friendly_payment_status(updated_record.get('status'))}",
         )
         # Refresh this same editor screen in place so the updated payment,
         # balance, and status show up immediately without navigating away.
@@ -2458,7 +2493,7 @@ class EditorPage(QWidget):
             .total-final span {{ display: table-cell; }}
             .total-final span:last-child {{ text-align: right; }}
             .footer {{ margin-top: 44px; padding-top: 16px; border-top: 1px solid #eef0f3; text-align: center; font-size: 10.5px; color: #9aa1a9; line-height: 1.7; }}
-            .watermark {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-32deg); white-space: nowrap; font-size: 190px; font-weight: 800; letter-spacing: 16px; color: {BRAND_BLUE}; opacity: 0.08; z-index: 0; }}
+            .watermark {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 100%; text-align: center; white-space: nowrap; font-size: 110px; font-weight: 800; letter-spacing: 6px; color: {BRAND_BLUE}; opacity: 0.08; z-index: 0; }}
         </style>
         </head>
         <body>
