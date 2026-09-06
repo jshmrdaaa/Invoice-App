@@ -8,6 +8,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import time
 import traceback
 import urllib.parse
 import urllib.request
@@ -71,7 +72,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.15"
+CURRENT_VERSION = "1.0.16"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2651,9 +2652,18 @@ def check_for_update():
 
 
 def download_and_relaunch(download_url):
-    """Downloads the new exe, writes a tiny helper script that swaps it in
-    after this process exits, and launches that helper. Returns True if the
-    handoff succeeded (caller should then exit immediately)."""
+    """Downloads the new exe and swaps it in directly, with no separate
+    helper script or hidden background process. Windows allows renaming a
+    program's own file while it's still running (the process keeps going
+    from its already-open handle), so the whole swap can happen right here.
+    An earlier version of this used a hidden helper .bat file to do the
+    swap after this process exited, but a detached, invisible cmd.exe
+    silently moving an exe around and relaunching it is exactly the kind of
+    behavior antivirus software kills on sight - which is what was actually
+    happening. Doing it in-process, visibly, from a program that's already
+    running and trusted, avoids that entirely.
+    Returns True if the swap and relaunch succeeded (caller should then exit
+    immediately and let the new process take over)."""
     if not getattr(sys, "frozen", False):
         log_update_event("Running from source (not a built exe) - skipping self-update.")
         return False  # only self-update the real built .exe, never the dev script
@@ -2661,7 +2671,7 @@ def download_and_relaunch(download_url):
     current_exe = sys.executable
     exe_dir = os.path.dirname(current_exe)
     new_exe_path = os.path.join(exe_dir, "_update_download.exe")
-    updater_bat_path = os.path.join(exe_dir, "_apply_update.bat")
+    backup_exe_path = os.path.join(exe_dir, "_previous_version.exe")
 
     try:
         with urllib.request.urlopen(download_url, timeout=60, context=https_context()) as response:
@@ -2671,50 +2681,50 @@ def download_and_relaunch(download_url):
         log_update_event(f"Download failed - {type(error).__name__}: {error}")
         return False
 
-    # Windows Defender (and other antivirus) commonly grabs a brief lock on a
-    # freshly-downloaded exe to scan it, which makes an immediate "move" fail.
-    # This retries a few times with short waits instead of giving up on the
-    # first try, and logs every step so a failure here is actually visible
-    # instead of just silently leaving the old version in place.
-    bat_contents = (
-        "@echo off\r\n"
-        f'set LOGFILE="{UPDATE_LOG_FILE}"\r\n'
-        f'echo %date% %time% - Updater started, waiting for the app to fully close... >> %LOGFILE%\r\n'
-        "timeout /t 3 /nobreak >nul\r\n"
-        "set ATTEMPTS=0\r\n"
-        ":retry\r\n"
-        "set /a ATTEMPTS+=1\r\n"
-        f'move /Y "{new_exe_path}" "{current_exe}" >nul 2>&1\r\n'
-        "if errorlevel 1 (\r\n"
-        '  echo %date% %time% - Move attempt %ATTEMPTS% failed - file may still be locked. >> %LOGFILE%\r\n'
-        "  if %ATTEMPTS% LSS 6 (\r\n"
-        "    timeout /t 2 /nobreak >nul\r\n"
-        "    goto retry\r\n"
-        "  )\r\n"
-        '  echo %date% %time% - Gave up after 6 attempts - keeping the old version and relaunching it. >> %LOGFILE%\r\n'
-        f'  start "" "{current_exe}"\r\n'
-        '  del "%~f0"\r\n'
-        "  exit /b\r\n"
-        ")\r\n"
-        'echo %date% %time% - File swap succeeded on attempt %ATTEMPTS%. >> %LOGFILE%\r\n'
-        f'start "" "{current_exe}"\r\n'
-        'echo %date% %time% - Relaunch command issued. >> %LOGFILE%\r\n'
-        'del "%~f0"\r\n'
-    )
-    try:
-        with open(updater_bat_path, "w") as bat_file:
-            bat_file.write(bat_contents)
+    # Clear out a leftover backup from a previous update, if there is one.
+    if os.path.exists(backup_exe_path):
+        try:
+            os.remove(backup_exe_path)
+        except OSError:
+            pass  # harmless - it'll just get cleaned up next time instead
 
-        subprocess.Popen(
-            ["cmd", "/c", updater_bat_path],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-        )
+    try:
+        os.rename(current_exe, backup_exe_path)
     except Exception as error:
-        log_update_event(f"Downloaded fine, but could not launch the updater helper - {type(error).__name__}: {error}")
+        log_update_event(f"Could not move the running exe out of the way - {type(error).__name__}: {error}")
         return False
 
-    log_update_event("Download complete - handing off to the updater script to finish the swap.")
+    # A freshly-downloaded exe can be briefly locked by antivirus scanning
+    # it, so this retries a handful of times with short waits rather than
+    # giving up on the first try.
+    swapped = False
+    last_error = None
+    for attempt in range(1, 7):
+        try:
+            os.rename(new_exe_path, current_exe)
+            swapped = True
+            log_update_event(f"New version swapped in successfully on attempt {attempt}.")
+            break
+        except Exception as error:
+            last_error = error
+            log_update_event(f"Swap attempt {attempt} failed - {type(error).__name__}: {error}")
+            time.sleep(2)
+
+    if not swapped:
+        try:
+            os.rename(backup_exe_path, current_exe)
+        except Exception:
+            pass  # if even this fails, the next launch's logic will sort it out
+        log_update_event(f"Gave up swapping in the new version after 6 tries - restored the previous version. Last error: {last_error}")
+        return False
+
+    try:
+        subprocess.Popen([current_exe])
+    except Exception as error:
+        log_update_event(f"Swapped in the new version but could not relaunch it - {type(error).__name__}: {error}")
+        return False
+
+    log_update_event("Update complete - relaunching the new version now.")
     return True
 
 
