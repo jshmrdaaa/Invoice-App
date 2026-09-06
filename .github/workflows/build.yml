@@ -21,11 +21,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6 pdfkit pypdf pyinstaller
+          pip install PySide6 pdfkit pypdf certifi pyinstaller
 
       - name: Build exe with PyInstaller
         run: |
-          python -m PyInstaller --clean --noconfirm --onefile --windowed --name "TA Invoices and Estimates" --icon "app_icon.ico" --hidden-import pypdf --add-data "logo_grayblue_transparent.png;." adael_desktop.py
+          python -m PyInstaller --clean --noconfirm --onefile --windowed --name "TA Invoices and Estimates" --icon "app_icon.ico" --hidden-import pypdf --collect-data certifi --add-data "logo_grayblue_transparent.png;." adael_desktop.py
 
       - name: Upload release
         uses: softprops/action-gh-release@v2

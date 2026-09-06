@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import traceback
@@ -13,6 +14,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
+import certifi
 import pdfkit
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap, QTextCharFormat, QTextCursor
@@ -69,7 +71,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.11"
+CURRENT_VERSION = "1.0.12"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2591,6 +2593,20 @@ def _version_tuple(version_string):
     return tuple(int(part) for part in parts) if parts else (0,)
 
 
+def https_context():
+    """Some Windows PCs (especially freshly set up ones) don't have a
+    complete local certificate store, which makes the bundled Python's SSL
+    checks fail with CERTIFICATE_VERIFY_FAILED even though the connection
+    itself is fine. Using certifi's bundled certificate list instead of
+    relying on Windows' own store sidesteps that. Falls back to the normal
+    default context if anything about this goes wrong, so this can never be
+    the thing that breaks the update check."""
+    try:
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def log_update_event(message):
     """Writes one dated line to update_log.txt in the app folder describing
     what happened during an update check. This is the only way Thiago can
@@ -2613,7 +2629,7 @@ def check_for_update():
             UPDATE_FEED_URL,
             headers={"Accept": "application/vnd.github+json", "User-Agent": "AdaelInvoiceApp"},
         )
-        with urllib.request.urlopen(request, timeout=4) as response:
+        with urllib.request.urlopen(request, timeout=4, context=https_context()) as response:
             data = json.loads(response.read().decode("utf-8"))
 
         remote_version = data.get("tag_name", "")
@@ -2648,7 +2664,7 @@ def download_and_relaunch(download_url):
     updater_bat_path = os.path.join(exe_dir, "_apply_update.bat")
 
     try:
-        with urllib.request.urlopen(download_url, timeout=60) as response:
+        with urllib.request.urlopen(download_url, timeout=60, context=https_context()) as response:
             with open(new_exe_path, "wb") as out_file:
                 shutil.copyfileobj(response, out_file)
     except Exception as error:
