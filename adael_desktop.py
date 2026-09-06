@@ -68,7 +68,7 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.8"
+CURRENT_VERSION = "1.0.9"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -816,9 +816,6 @@ class HomePage(QWidget):
         self.payment_history.setPlaceholderText("Select an invoice to see payment history.")
         invoices_layout.addWidget(self.payment_history)
 
-        fix_label = QLabel("Made a mistake? Fix a payment already on the list above:")
-        fix_label.setObjectName("mutedText")
-        invoices_layout.addWidget(fix_label)
         payment_fix_row = QHBoxLayout()
         payment_fix_row.setSpacing(10)
         self.payment_select = QComboBox()
@@ -833,9 +830,6 @@ class HomePage(QWidget):
         payment_fix_row.addWidget(delete_payment)
         invoices_layout.addLayout(payment_fix_row)
 
-        new_payment_label = QLabel("Received a new payment? Add it here:")
-        new_payment_label.setObjectName("mutedText")
-        invoices_layout.addWidget(new_payment_label)
         payment_row = QHBoxLayout()
         payment_row.setSpacing(10)
         self.payment_amount = QLineEdit()
