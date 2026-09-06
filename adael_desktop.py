@@ -71,7 +71,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.12"
+CURRENT_VERSION = "1.0.13"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -643,7 +643,7 @@ class HomePage(QWidget):
         title_box.setSpacing(8)
         title = QLabel("Adael Construction")
         title.setObjectName("homeTitle")
-        subtitle = QLabel("Invoices & Estimates")
+        subtitle = QLabel(f"Invoices & Estimates  ·  v{CURRENT_VERSION}")
         subtitle.setObjectName("mutedText")
         buttons = QHBoxLayout()
         buttons.setSpacing(12)
