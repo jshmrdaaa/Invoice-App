@@ -63,12 +63,13 @@ INVOICE_HISTORY_FILE = os.path.join(APP_DIR, "invoice_history.json")
 ESTIMATE_HISTORY_FILE = os.path.join(APP_DIR, "estimate_history.json")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 BACKUP_DIR = os.path.join(APP_DIR, "backups")
+UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 
 # ============================================================
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.10"
+CURRENT_VERSION = "1.0.11"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2590,6 +2591,19 @@ def _version_tuple(version_string):
     return tuple(int(part) for part in parts) if parts else (0,)
 
 
+def log_update_event(message):
+    """Writes one dated line to update_log.txt in the app folder describing
+    what happened during an update check. This is the only way Thiago can
+    see why an update did or didn't happen on a computer he isn't sitting
+    at - it never shows anything to the person using the app, and it can
+    never crash the app even if writing the log itself fails."""
+    try:
+        with open(UPDATE_LOG_FILE, "a") as file:
+            file.write(f"{datetime.today().strftime('%Y/%m/%d %H:%M:%S')} - {message}\n")
+    except Exception:
+        pass
+
+
 def check_for_update():
     """Returns (download_url, version_string) if a newer build exists online, else None.
     Never raises - any problem (no internet, GitHub down, no release yet) just
@@ -2603,15 +2617,20 @@ def check_for_update():
             data = json.loads(response.read().decode("utf-8"))
 
         remote_version = data.get("tag_name", "")
+        log_update_event(f"Checked for updates OK. This computer: {CURRENT_VERSION}. Latest online: {remote_version}.")
         if _version_tuple(remote_version) <= _version_tuple(CURRENT_VERSION):
+            log_update_event("Already on the latest version - nothing to download.")
             return None
 
         for asset in data.get("assets", []):
             if asset.get("name", "").lower().endswith(".exe"):
+                log_update_event(f"Found version {remote_version} online - attempting to download it now.")
                 return asset.get("browser_download_url"), remote_version
 
+        log_update_event(f"Version {remote_version} exists online but has no .exe file attached to it - can't update.")
         return None
-    except Exception:
+    except Exception as error:
+        log_update_event(f"Could not check for updates - {type(error).__name__}: {error}")
         return None
 
 
@@ -2620,6 +2639,7 @@ def download_and_relaunch(download_url):
     after this process exits, and launches that helper. Returns True if the
     handoff succeeded (caller should then exit immediately)."""
     if not getattr(sys, "frozen", False):
+        log_update_event("Running from source (not a built exe) - skipping self-update.")
         return False  # only self-update the real built .exe, never the dev script
 
     current_exe = sys.executable
@@ -2631,7 +2651,8 @@ def download_and_relaunch(download_url):
         with urllib.request.urlopen(download_url, timeout=60) as response:
             with open(new_exe_path, "wb") as out_file:
                 shutil.copyfileobj(response, out_file)
-    except Exception:
+    except Exception as error:
+        log_update_event(f"Download failed - {type(error).__name__}: {error}")
         return False
 
     bat_contents = (
@@ -2650,9 +2671,11 @@ def download_and_relaunch(download_url):
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
-    except Exception:
+    except Exception as error:
+        log_update_event(f"Downloaded fine, but could not launch the updater helper - {type(error).__name__}: {error}")
         return False
 
+    log_update_event("Download complete - handing off to the updater script to finish the swap.")
     return True
 
 

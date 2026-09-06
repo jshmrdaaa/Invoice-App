@@ -6,6 +6,7 @@ estimate_history.json
 invoice_counter.txt
 estimate_counter.txt
 past_invoice_counter.txt
+update_log.txt
 
 # Build output
 build/
