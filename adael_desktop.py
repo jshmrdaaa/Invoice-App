@@ -72,7 +72,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.19"
+CURRENT_VERSION = "1.0.20"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2761,7 +2761,14 @@ def download_and_relaunch(download_url):
         return False
 
     try:
-        subprocess.Popen([current_exe])
+        # PyInstaller's bootloader assumes a process launched from the same
+        # exe as its parent is a worker subprocess reusing the parent's
+        # already-unpacked files, not a fresh restart. Without this flag it
+        # refuses to start with "Security validation failure: parent
+        # process has different executable!" since the parent's on-disk
+        # file was just swapped out from under it.
+        restart_env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+        subprocess.Popen([current_exe], env=restart_env)
     except Exception as error:
         log_update_event(f"Swapped in the new version but could not relaunch it - {type(error).__name__}: {error}")
         return False
