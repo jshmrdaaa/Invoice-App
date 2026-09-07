@@ -72,7 +72,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.18"
+CURRENT_VERSION = "1.0.19"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -1859,6 +1859,9 @@ class EditorPage(QWidget):
         self.save_button = QPushButton("Save Changes")
         self.save_button.setObjectName("secondaryButton")
         self.save_button.clicked.connect(self.save_changes)
+        self.convert_button = QPushButton("Convert to Invoice")
+        self.convert_button.setObjectName("secondaryButton")
+        self.convert_button.clicked.connect(self.convert_to_invoice)
         self.preview_button = QPushButton("Preview PDF")
         self.generate_button = QPushButton("Generate PDF")
         self.preview_button.setMinimumHeight(42)
@@ -1878,6 +1881,7 @@ class EditorPage(QWidget):
         totals_box.addRow("Total", self.total_label)
         totals_box.addRow("Balance Due", self.balance_label)
         totals_box.addRow(self.save_button)
+        totals_box.addRow(self.convert_button)
         totals_box.addRow(self.preview_button)
         totals_box.addRow(self.generate_button)
         totals_widget = QWidget()
@@ -1917,6 +1921,7 @@ class EditorPage(QWidget):
         can_add_payment = document_type == "invoice" and loaded_history and self.loaded_status != "VOID"
         self.add_payment_button.setVisible(can_add_payment)
         self.save_button.setText("Save Changes" if loaded_history else "Save Draft")
+        self.convert_button.setVisible(document_type == "estimate")
         if document_type == "invoice" and self.current_payments:
             paid_total = round(sum(clean_float(p.get("amount")) for p in self.current_payments), 2)
             lines = [
@@ -2239,6 +2244,33 @@ class EditorPage(QWidget):
             "Changes saved.\n\nThe existing PDF file wasn't touched — use \"Generate PDF\" "
             "if you need a fresh PDF that includes these changes.",
         )
+
+    def convert_to_invoice(self):
+        """Turns the estimate currently open in the editor into a brand-new
+        invoice, right from the estimate screen - no need to save it first
+        and go find it on the Home screen. Saves the estimate as a draft
+        first so nothing typed gets lost, then opens a fresh invoice
+        pre-filled with the same customer/items/total."""
+        if self.document_type != "estimate":
+            return
+        data = self.document_data()
+        if not self.has_content(data):
+            QMessageBox.information(self, "Nothing to Convert", "Add some details first, then convert.")
+            return
+        self.save_draft()
+        new_invoice = data.copy()
+        new_invoice["document_type"] = "invoice"
+        new_invoice["invoice_number"] = get_next_number("invoice")
+        increase_number("invoice")
+        new_invoice["invoice_date"] = today_text()
+        new_invoice["amount_paid"] = ""
+        new_invoice["payments"] = []
+        new_invoice["balance_due"] = clean_float(new_invoice.get("total", 0))
+        new_invoice.pop("pdf_path", None)
+        new_invoice.pop("pdf_name", None)
+        new_invoice.pop("status", None)
+        new_invoice.pop("draft_id", None)
+        self.window.open_editor("invoice", new_invoice)
 
     def add_payment(self):
         if self.document_type != "invoice" or not self.loaded_history:
