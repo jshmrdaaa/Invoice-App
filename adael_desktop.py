@@ -72,7 +72,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.17"
+CURRENT_VERSION = "1.0.18"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -325,9 +325,15 @@ def pdfkit_config():
     for path in [
         r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe",
         r"C:\Program Files (x86)\wkhtmltopdf\bin\wkhtmltopdf.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "wkhtmltopdf", "bin", "wkhtmltopdf.exe"),
     ]:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             return pdfkit.configuration(wkhtmltopdf=path)
+    # Not in any of the usual install folders - check whether it's on PATH
+    # at all (e.g. installed to a custom location) before giving up.
+    on_path = shutil.which("wkhtmltopdf")
+    if on_path:
+        return pdfkit.configuration(wkhtmltopdf=on_path)
     return None
 
 
@@ -2266,7 +2272,9 @@ class EditorPage(QWidget):
                 self,
                 "Preview Error",
                 "The preview PDF could not be created.\n\n"
-                "Make sure wkhtmltopdf is installed on this computer.\n\n"
+                "This computer is missing a required program called wkhtmltopdf. "
+                "Download and install it from wkhtmltopdf.org/downloads.html "
+                "(choose the Windows installer), then try again.\n\n"
                 f"Details: {error}"
             )
 
@@ -2286,7 +2294,9 @@ class EditorPage(QWidget):
                 self,
                 "PDF Error",
                 "The PDF could not be created.\n\n"
-                "Make sure wkhtmltopdf is installed on this computer.\n\n"
+                "This computer is missing a required program called wkhtmltopdf. "
+                "Download and install it from wkhtmltopdf.org/downloads.html "
+                "(choose the Windows installer), then try again.\n\n"
                 f"Details: {error}"
             )
 
