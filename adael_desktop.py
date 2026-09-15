@@ -72,7 +72,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.20"
+CURRENT_VERSION = "1.0.21"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -364,6 +364,66 @@ def friendly_payment_status(status):
         "SAVED": "No amount due",
         "VOID": "Void",
     }.get(status, status)
+
+
+def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_now=True):
+    """Shared 'email this to the customer' flow used both right after
+    generating a PDF and from the saved Invoices/Estimates lists on the
+    Home screen. Opens the customer's Yahoo Mail compose window pre-filled
+    with a subject and message - Yahoo Mail's compose link can't attach
+    files itself, so the PDF is opened on this computer first to make it
+    quick to drag into the email. Returns True if an email was sent off to
+    be composed, False if it stopped early (no email on file, or the user
+    backed out)."""
+    email_raw = (record.get("customer_email_small") or "").strip()
+    if not email_raw:
+        QMessageBox.information(
+            parent,
+            "No Email on File",
+            "This customer doesn't have an email address saved.\n\n"
+            "Add one from the editor or the Customers tab, then try again.",
+        )
+        return False
+    doc_label = "Estimate" if document_type == "estimate" else "Invoice"
+    doc_num = record.get("invoice_number", "")
+    total = money(record.get("total", 0))
+    project = (record.get("project_name") or "").strip()
+    project_line = f" – {project}" if project else ""
+    customer = (record.get("customer_name_big") or "").strip()
+
+    settings = get_settings()
+    company = settings.get("company_name", "Adael Construction LLC")
+    msg_body = (
+        f"Hi {customer}, your {doc_label} #{doc_num}{project_line} "
+        f"from {company} is ready. Total: {total}. "
+        f"Please reach out with any questions."
+    )
+
+    has_pdf = bool(pdf_path) and os.path.exists(pdf_path)
+    attach_note = (
+        "(The PDF will open on this computer — attach it to the email before sending.)"
+        if has_pdf else
+        "(No saved PDF was found for this one — open or generate its PDF first if you want to attach it.)"
+    )
+    answer = QMessageBox.question(
+        parent,
+        f"Send {doc_label}",
+        f"Open Yahoo Mail to email this {doc_label.lower()} to {email_raw}?\n\n"
+        f"Message preview:\n{msg_body}\n\n{attach_note}",
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+    if answer != QMessageBox.Yes:
+        return False
+    if has_pdf and open_pdf_now:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
+    subject = urllib.parse.quote(f"{doc_label} #{doc_num} from {company}")
+    email_body = urllib.parse.quote(msg_body)
+    to_address = urllib.parse.quote(email_raw)
+    QDesktopServices.openUrl(QUrl(
+        f"https://compose.mail.yahoo.com/?to={to_address}&subject={subject}&body={email_body}"
+    ))
+    return True
 
 
 def invoice_paid_total(record):
@@ -855,11 +915,14 @@ class HomePage(QWidget):
         invoice_saved_actions.setSpacing(10)
         open_invoice = QPushButton("Open Invoice")
         open_invoice_pdf = QPushButton("Open Invoice PDF")
+        email_invoice = QPushButton("Email Invoice")
         open_invoice.setObjectName("primaryButton")
         open_invoice.clicked.connect(lambda: self.open_history("invoice"))
         open_invoice_pdf.clicked.connect(lambda: self.open_history_pdf("invoice"))
+        email_invoice.clicked.connect(lambda: self.email_history_record("invoice"))
         invoice_saved_actions.addWidget(open_invoice)
         invoice_saved_actions.addWidget(open_invoice_pdf)
+        invoice_saved_actions.addWidget(email_invoice)
         invoice_saved_actions.addStretch(1)
         invoices_layout.addLayout(invoice_saved_actions)
 
@@ -892,14 +955,17 @@ class HomePage(QWidget):
         estimate_saved_actions.setSpacing(10)
         open_estimate = QPushButton("Open Estimate")
         open_estimate_pdf = QPushButton("Open Estimate PDF")
+        email_estimate = QPushButton("Email Estimate")
         make_invoice = QPushButton("Make Invoice From Estimate")
         open_estimate.setObjectName("primaryButton")
         make_invoice.setObjectName("primaryButton")
         open_estimate.clicked.connect(lambda: self.open_history("estimate"))
         open_estimate_pdf.clicked.connect(lambda: self.open_history_pdf("estimate"))
+        email_estimate.clicked.connect(lambda: self.email_history_record("estimate"))
         make_invoice.clicked.connect(self.make_invoice_from_estimate)
         estimate_saved_actions.addWidget(open_estimate)
         estimate_saved_actions.addWidget(open_estimate_pdf)
+        estimate_saved_actions.addWidget(email_estimate)
         estimate_saved_actions.addWidget(make_invoice)
         estimate_saved_actions.addStretch(1)
         estimates_layout.addLayout(estimate_saved_actions)
@@ -1665,6 +1731,13 @@ class HomePage(QWidget):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
 
+    def email_history_record(self, document_type):
+        record = self.selected_history_record(document_type)
+        if not record:
+            QMessageBox.information(self, "Email", f"Select a saved {document_type} first.")
+            return
+        offer_email_document(self, document_type, record, pdf_path=record.get("pdf_path", ""), open_pdf_now=True)
+
     def delete_history_record(self, document_type):
         record = self.selected_history_record(document_type)
         if not record:
@@ -1909,14 +1982,17 @@ class EditorPage(QWidget):
         self.loaded_pdf_name = data.get("pdf_name", "")
         self.loaded_saved_at = data.get("saved_at", "")
         self.loaded_status = data.get("status", "")
-        # Once an invoice has real payment history, only "Add Payment" (here
-        # or from the Home screen) should touch it - editing here and
-        # resaving must never overwrite or collapse the dated payment records.
-        self.amount_paid.setReadOnly(document_type == "invoice" and bool(self.current_payments))
+        # Amount Paid is a running total, not something to type into - the
+        # only ways to change it are "+ Add Payment" here (or "Add New
+        # Payment"/"Edit Selected Payment" on the Home screen). Locking it
+        # for every invoice, not just ones with existing payments, avoids
+        # a typed number here silently doing nothing (or, worse, being
+        # confused for an actual payment when it's really just a total).
+        self.amount_paid.setReadOnly(document_type == "invoice")
         self.amount_paid.setToolTip(
-            "Use the \"+ Add Payment\" button to add payments - "
-            "editing this box won't change anything once payments exist."
-            if self.current_payments else ""
+            "This is just a running total - use \"+ Add Payment\" (or \"Add New Payment\" "
+            "on the Home screen) to record a payment."
+            if document_type == "invoice" else ""
         )
         can_add_payment = document_type == "invoice" and loaded_history and self.loaded_status != "VOID"
         self.add_payment_button.setVisible(can_add_payment)
@@ -2333,41 +2409,9 @@ class EditorPage(QWidget):
             )
 
     def _offer_send(self, data):
-        email_raw = data.get("customer_email_small", "").strip()
-        if not email_raw:
-            return
-        doc_label = "Estimate" if self.document_type == "estimate" else "Invoice"
-        doc_num = data.get("invoice_number", "")
-        total = money(data.get("total", 0))
-        project = data.get("project_name", "").strip()
-        project_line = f" – {project}" if project else ""
-        customer = data.get("customer_name_big", "").strip()
-
-        settings = get_settings()
-        company = settings.get("company_name", "Adael Construction LLC")
-        msg_body = (
-            f"Hi {customer}, your {doc_label} #{doc_num}{project_line} "
-            f"from {company} is ready. Total: {total}. "
-            f"Please reach out with any questions."
-        )
-
-        answer = QMessageBox.question(
-            self,
-            f"Send {doc_label}",
-            f"Open Yahoo Mail to email this {doc_label.lower()} to {email_raw}?\n\n"
-            f"Message preview:\n{msg_body}\n\n"
-            f"(The PDF opened on this computer — attach it to the email before sending.)",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if answer != QMessageBox.Yes:
-            return
-        subject = urllib.parse.quote(f"{doc_label} #{doc_num} from {company}")
-        email_body = urllib.parse.quote(msg_body)
-        to_address = urllib.parse.quote(email_raw)
-        QDesktopServices.openUrl(QUrl(
-            f"https://compose.mail.yahoo.com/?to={to_address}&subject={subject}&body={email_body}"
-        ))
+        # The PDF was already opened on this computer right before this is
+        # called, so open_pdf_now=False avoids popping it open a second time.
+        offer_email_document(self, self.document_type, data, open_pdf_now=False)
 
     def save_customer(self, data):
         name = data["customer_name_big"].strip()
@@ -2537,11 +2581,12 @@ class EditorPage(QWidget):
             .total-final span {{ display: table-cell; }}
             .total-final span:last-child {{ text-align: right; }}
             .footer {{ margin-top: 44px; padding-top: 16px; border-top: 1px solid #eef0f3; text-align: center; font-size: 10.5px; color: #9aa1a9; line-height: 1.7; }}
-            .watermark {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 100%; text-align: center; white-space: nowrap; font-size: 110px; font-weight: 800; letter-spacing: 6px; color: {BRAND_BLUE}; opacity: 0.08; z-index: 0; }}
+            .watermark-wrap {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: table; z-index: 0; }}
+            .watermark {{ display: table-cell; vertical-align: middle; text-align: center; white-space: nowrap; font-size: 110px; font-weight: 800; letter-spacing: 6px; color: {BRAND_BLUE}; opacity: 0.08; }}
         </style>
         </head>
         <body>
-            {'<div class="watermark">ESTIMATE</div>' if self.document_type == "estimate" else ""}
+            {'<div class="watermark-wrap"><div class="watermark">ESTIMATE</div></div>' if self.document_type == "estimate" else ""}
             <div class="header-row">
                 <div class="header-left">
                     {logo_html}
