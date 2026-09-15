@@ -77,7 +77,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.25"
+CURRENT_VERSION = "1.0.26"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -392,25 +392,18 @@ def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_no
     be composed, False if it stopped early (no email on file, or the user
     backed out)."""
     email_raw = (record.get("customer_email_small") or "").strip()
-    if not email_raw:
-        QMessageBox.information(
-            parent,
-            "No Email on File",
-            "This customer doesn't have an email address saved.\n\n"
-            "Add one from the editor or the Customers tab, then try again.",
-        )
-        return False
     doc_label = "Estimate" if document_type == "estimate" else "Invoice"
     doc_num = record.get("invoice_number", "")
     total = money(record.get("total", 0))
     project = (record.get("project_name") or "").strip()
     project_line = f" – {project}" if project else ""
     customer = (record.get("customer_name_big") or "").strip()
+    greeting = f"Hi {customer}, your" if customer else "Your"
 
     settings = get_settings()
     company = settings.get("company_name", "Adael Construction LLC")
     msg_body = (
-        f"Hi {customer}, your {doc_label} #{doc_num}{project_line} "
+        f"{greeting} {doc_label} #{doc_num}{project_line} "
         f"from {company} is ready. Total: {total}. "
         f"Please reach out with any questions."
     )
@@ -421,10 +414,11 @@ def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_no
         if has_pdf else
         "(No saved PDF was found for this one — open or generate its PDF first if you want to attach it.)"
     )
+    to_line = f" to {email_raw}" if email_raw else " - no email is saved for this customer, so you'll type or paste one in once Yahoo Mail opens"
     answer = QMessageBox.question(
         parent,
         f"Send {doc_label}",
-        f"Open Yahoo Mail to email this {doc_label.lower()} to {email_raw}?\n\n"
+        f"Open Yahoo Mail to email this {doc_label.lower()}{to_line}?\n\n"
         f"Message preview:\n{msg_body}\n\n{attach_note}",
         QMessageBox.Yes | QMessageBox.No,
         QMessageBox.Yes,
@@ -435,9 +429,9 @@ def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_no
         QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
     subject = urllib.parse.quote(f"{doc_label} #{doc_num} from {company}")
     email_body = urllib.parse.quote(msg_body)
-    to_address = urllib.parse.quote(email_raw)
+    to_param = f"to={urllib.parse.quote(email_raw)}&" if email_raw else ""
     QDesktopServices.openUrl(QUrl(
-        f"https://compose.mail.yahoo.com/?to={to_address}&subject={subject}&body={email_body}"
+        f"https://compose.mail.yahoo.com/?{to_param}subject={subject}&body={email_body}"
     ))
     return True
 
