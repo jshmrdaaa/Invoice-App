@@ -60,6 +60,8 @@ LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME)
 WRITABLE_LOGO_PATH = os.path.join(APP_DIR, LOGO_FILENAME)
 WATERMARK_FILENAME = "watermark_estimate.png"
 WATERMARK_PATH = os.path.join(BASE_DIR, WATERMARK_FILENAME)
+DICTIONARY_FILENAME = "dictionary_words.txt"
+DICTIONARY_PATH = os.path.join(BASE_DIR, DICTIONARY_FILENAME)
 INVOICE_COUNTER_FILE = os.path.join(APP_DIR, "invoice_counter.txt")
 ESTIMATE_COUNTER_FILE = os.path.join(APP_DIR, "estimate_counter.txt")
 PAST_INVOICE_COUNTER_FILE = os.path.join(APP_DIR, "past_invoice_counter.txt")
@@ -75,7 +77,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.24"
+CURRENT_VERSION = "1.0.25"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -110,6 +112,17 @@ COMMON_TEXT_FIXES = {
     "invocie": "invoice",
     "remvoe": "remove",
     "removeing": "removing",
+    "fot": "for",
+    "instal": "install",
+    "instalation": "installation",
+    "installlation": "installation",
+    "cieling": "ceiling",
+    "cabinat": "cabinet",
+    "cabinats": "cabinets",
+    "electrican": "electrician",
+    "plumer": "plumber",
+    "conrete": "concrete",
+    "drywal": "drywall",
     "w/": "with",
 }
 
@@ -590,9 +603,133 @@ def extract_total_from_pdf_text(text):
     return max(amounts) if amounts else 0
 
 
-def text_issues(value):
+_DICTIONARY_WORDS = None
+_WORD_TOKEN_PATTERN = re.compile(r"[A-Za-z']+")
+_SPELLING_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _load_dictionary():
+    """Loads the bundled English word list once and reuses it - this is
+    what lets the app tell "fot" isn't a word without needing the
+    internet or any outside service. If the file is somehow missing, spell
+    -check just quietly falls back to the short curated typo list instead
+    of crashing."""
+    global _DICTIONARY_WORDS
+    if _DICTIONARY_WORDS is None:
+        words = set()
+        try:
+            with open(DICTIONARY_PATH, "r", encoding="utf-8") as file:
+                words = {line.strip().lower() for line in file if line.strip()}
+        except OSError:
+            pass
+        words.update(word.lower() for word in COMMON_TEXT_FIXES.values())
+        _DICTIONARY_WORDS = words
+    return _DICTIONARY_WORDS
+
+
+def _spelling_edits1(word):
+    """Every string one letter-edit away from word (a missing letter, an
+    extra letter, a swapped pair, or a wrong letter) - the classic
+    approach behind most offline spell-checkers."""
+    splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
+    deletes = (a + b[1:] for a, b in splits if b)
+    transposes = (a + b[1] + b[0] + b[2:] for a, b in splits if len(b) > 1)
+    replaces = (a + c + b[1:] for a, b in splits if b for c in _SPELLING_ALPHABET)
+    inserts = (a + c + b for a, b in splits for c in _SPELLING_ALPHABET)
+    return set(deletes) | set(transposes) | set(replaces) | set(inserts)
+
+
+def _spelling_suggestions(word, dictionary, try_harder=False):
+    """Every dictionary word that's a plausible correction for an
+    unrecognized word, closest in length to the original first (a typo is
+    almost always close in length to the word that was meant). Empty if
+    nothing in the dictionary is close enough to be a reasonable guess.
+    Only goes out to a second letter-edit (try_harder=True) for the "Fix
+    Wording" button - checking every word live as someone types stays on
+    one-letter-edits so it's never slow enough to notice."""
+    if not word or _word_known(word, dictionary):
+        return []
+    candidates = {edit for edit in _spelling_edits1(word) if _word_known(edit, dictionary)}
+    if not candidates and try_harder and len(word) >= 4:
+        candidates = {
+            edit2
+            for edit1 in _spelling_edits1(word)
+            for edit2 in _spelling_edits1(edit1)
+            if _word_known(edit2, dictionary)
+        }
+    return sorted(candidates, key=lambda candidate: (abs(len(candidate) - len(word)), candidate))
+
+
+def _word_known(word, dictionary):
+    """True if word is in the dictionary either as-is or as a regular
+    inflection of a word that is (plurals, -ed/-ing/-er/-est/-ly forms).
+    The bundled word list is deliberately just a plain list of base words,
+    not a full copy of every inflected form (that's normally handled by a
+    dictionary's own affix rules), so without this, ordinary words like
+    "included" or "painting" would get wrongly flagged as typos."""
+    if word in dictionary:
+        return True
+    if word.endswith("ies") and (word[:-3] + "y") in dictionary:
+        return True
+    if word.endswith("es") and word[:-2] in dictionary:
+        return True
+    if word.endswith("s") and word[:-1] in dictionary:
+        return True
+    if word.endswith("ing"):
+        stem = word[:-3]
+        if stem in dictionary or (stem + "e") in dictionary:
+            return True
+        if len(stem) > 1 and stem[-1] == stem[-2] and stem[:-1] in dictionary:
+            return True  # "running" -> "run"
+    if word.endswith("ed"):
+        stem = word[:-2]
+        if stem in dictionary or (stem + "e") in dictionary:
+            return True
+        if len(stem) > 1 and stem[-1] == stem[-2] and stem[:-1] in dictionary:
+            return True  # "stopped" -> "stop"
+    if word.endswith("er") and word[:-2] in dictionary:
+        return True
+    if word.endswith("est") and word[:-3] in dictionary:
+        return True
+    if word.endswith("ly") and word[:-2] in dictionary:
+        return True
+    return False
+
+
+def _dictionary_issues(text, try_harder=False):
+    dictionary = _load_dictionary()
+    issues = []
+    for match in _WORD_TOKEN_PATTERN.finditer(text):
+        word = match.group(0)
+        core = word.strip("'")
+        if len(core) <= 2 or core.isupper() or any(char.isdigit() for char in word):
+            continue
+        lower = core.lower()
+        if _word_known(lower, dictionary):
+            continue
+        before = text[:match.start()].rstrip()
+        is_sentence_start = not before or before[-1] in ".!?\n"
+        if core[:1].isupper() and not is_sentence_start:
+            continue  # probably a name, not a typo
+        suggestions = _spelling_suggestions(lower, dictionary, try_harder=try_harder)
+        # Several equally-plausible words is common for short typos (e.g.
+        # "fot" is one letter-edit from "for", "fog", "fit", "lot" and
+        # more) - shown as a slash-separated hint rather than guessed at,
+        # since picking wrong silently would be worse than not fixing it.
+        issues.append({
+            "start": match.start(),
+            "end": match.end(),
+            "wrong": word,
+            "right": "/".join(suggestions[:3]) if suggestions else word,
+            "confident_fix": suggestions[0] if len(suggestions) == 1 else None,
+        })
+    return issues
+
+
+def text_issues(value, try_harder=False):
     text = str(value or "")
     issues = []
+    covered = []
     for wrong, right in COMMON_TEXT_FIXES.items():
         pattern = rf"(?<!\w){re.escape(wrong)}(?!\w)"
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
@@ -601,30 +738,94 @@ def text_issues(value):
                 "end": match.end(),
                 "wrong": match.group(0),
                 "right": right,
+                "confident_fix": right,
             })
+            covered.append((match.start(), match.end()))
+    for issue in _dictionary_issues(text, try_harder=try_harder):
+        if any(start < issue["end"] and issue["start"] < end for start, end in covered):
+            continue
+        issues.append(issue)
     return sorted(issues, key=lambda issue: issue["start"])
 
 
-def autocorrected_text(value):
+def autocorrected_text(value, try_harder=False):
     """Applies the same typo list used for spell-check underlining and returns
     the corrected string outright, preserving the capitalization of whatever
     was typed. Used to auto-fix a whole field's text at once (e.g. when a
-    table cell or line edit loses focus)."""
+    table cell or line edit loses focus). Only ever applies a fix it's sure
+    about - a dictionary word that isn't recognized but has several
+    equally-plausible corrections stays as-typed (still underlined
+    elsewhere) instead of being silently swapped for a guess."""
     text = str(value or "")
-    issues = text_issues(text)
+    issues = text_issues(text, try_harder=try_harder)
     if not issues:
         return text
     pieces = []
     cursor = 0
     for issue in issues:
+        fixed = issue.get("confident_fix")
+        if not fixed:
+            continue
         pieces.append(text[cursor:issue["start"]])
-        fixed = issue["right"]
         if issue["wrong"][:1].isupper():
             fixed = fixed[:1].upper() + fixed[1:]
         pieces.append(fixed)
         cursor = issue["end"]
     pieces.append(text[cursor:])
     return "".join(pieces)
+
+
+def smart_cleanup_text(value):
+    """The "Fix Wording" pass - a bigger cleanup than the always-on typo
+    autocorrect. Fixes spelling using the same list as everywhere else in
+    the app, plus a handful of common awkward-phrasing patterns (a stray
+    "to" glued onto an "-ing" word, missing capital letters, doubled-up
+    words, missing end punctuation, stray double spaces). This runs
+    entirely on this computer - no internet connection or outside service
+    involved - so it can't catch everything a person proofreading it
+    would, but it cleans up the most common rough edges."""
+    text = str(value or "")
+    if not text.strip():
+        return text
+    return "\n".join(_smart_cleanup_line(line) for line in text.split("\n"))
+
+
+_SENTENCE_SPLIT_PATTERN = re.compile(r"[^.!?]+[.!?]*")
+_LEADING_GERUND_FILLER_PATTERN = re.compile(r"^to\s+(\w+ing)\b", re.IGNORECASE)
+_DOUBLED_WORD_PATTERN = re.compile(r"\b(\w+)\s+\1\b", re.IGNORECASE)
+_EXTRA_SPACE_PATTERN = re.compile(r"[ \t]{2,}")
+_STANDALONE_I_PATTERN = re.compile(r"\bi\b")
+
+
+def _smart_cleanup_line(line):
+    if not line.strip():
+        return line
+    leading_ws = line[:len(line) - len(line.lstrip())]
+    trailing_ws = line[len(line.rstrip()):]
+    body = line.strip()
+    sentences = _SENTENCE_SPLIT_PATTERN.findall(body)
+    fixed = [_smart_cleanup_sentence(sentence) for sentence in sentences]
+    return leading_ws + " ".join(part for part in fixed if part) + trailing_ws
+
+
+def _smart_cleanup_sentence(sentence):
+    text = sentence.strip()
+    if not text:
+        return ""
+    text = _EXTRA_SPACE_PATTERN.sub(" ", text)
+    # "to doing the demo" -> "doing the demo" - a stray "to" glued onto an
+    # "-ing" word at the start of a sentence almost always means the "to"
+    # doesn't belong there.
+    text = _LEADING_GERUND_FILLER_PATTERN.sub(lambda match: match.group(1), text)
+    # "the the wall" -> "the wall"
+    text = _DOUBLED_WORD_PATTERN.sub(r"\1", text)
+    text = autocorrected_text(text, try_harder=True)
+    text = _STANDALONE_I_PATTERN.sub("I", text)
+    if text:
+        text = text[0].upper() + text[1:]
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
 
 
 def _autocorrect_last_word(text, cursor_pos, boundary_chars=" \t\n"):
@@ -1943,23 +2144,44 @@ class EditorPage(QWidget):
         item_buttons.setSpacing(10)
         add_item = QPushButton("+ Add Item")
         delete_item = QPushButton("Delete Selected Item")
+        fix_item_wording = QPushButton("Fix Wording")
         add_item.setObjectName("primaryButton")
         delete_item.setObjectName("dangerButton")
         add_item.clicked.connect(lambda: self.add_item())
         delete_item.clicked.connect(self.delete_item)
+        fix_item_wording.clicked.connect(self.fix_item_wording)
+        fix_item_wording.setToolTip(
+            "Cleans up spelling and awkward phrasing in every item's Description - "
+            "runs right here on this computer, no internet needed."
+        )
         item_buttons.addWidget(add_item)
         item_buttons.addWidget(delete_item)
+        item_buttons.addWidget(fix_item_wording)
         item_buttons.addStretch()
         layout.addLayout(item_buttons)
 
         bottom = QHBoxLayout()
         bottom.setSpacing(18)
+        notes_column = QVBoxLayout()
+        notes_column.setSpacing(6)
+        notes_header = QHBoxLayout()
+        notes_header.addWidget(QLabel("Notes"))
+        notes_header.addStretch()
+        fix_notes_wording = QPushButton("Fix Wording")
+        fix_notes_wording.setToolTip(
+            "Cleans up spelling and awkward phrasing in the Notes box - "
+            "runs right here on this computer, no internet needed."
+        )
+        fix_notes_wording.clicked.connect(self.fix_notes_wording)
+        notes_header.addWidget(fix_notes_wording)
+        notes_column.addLayout(notes_header)
         self.notes = QTextEdit()
         self.notes.setPlaceholderText("Notes, payment terms, job details, warranty info...")
         self.notes.setMinimumHeight(150)
         self.notes.textChanged.connect(lambda: autocorrect_text_edit(self.notes))
         self.notes.textChanged.connect(self.mark_notes_spelling)
-        bottom.addWidget(self.notes, 2)
+        notes_column.addWidget(self.notes)
+        bottom.addLayout(notes_column, 2)
 
         totals_box = QFormLayout()
         totals_box.setSpacing(10)
@@ -2159,6 +2381,34 @@ class EditorPage(QWidget):
         self.items.removeRow(row)
         self.recalculate()
 
+    def fix_item_wording(self):
+        """Runs the "Fix Wording" cleanup on every item's Description at
+        once - spelling fixes plus a few common awkward-phrasing patterns,
+        all done locally on this computer."""
+        if self.items.rowCount() == 0:
+            QMessageBox.information(self, "Fix Wording", "Add an item first.")
+            return
+        self.items.blockSignals(True)
+        changed = 0
+        for row in range(self.items.rowCount()):
+            item = self.items.item(row, 1)
+            if not item:
+                continue
+            fixed = smart_cleanup_text(item.text())
+            if fixed != item.text():
+                item.setText(fixed)
+                changed += 1
+            self.items.resizeRowToContents(row)
+        self.items.blockSignals(False)
+        for row in range(self.items.rowCount()):
+            self.mark_item_spelling(row, 1)
+        QMessageBox.information(
+            self,
+            "Fix Wording",
+            f"Cleaned up {changed} item description{'s' if changed != 1 else ''}."
+            if changed else "Nothing needed fixing.",
+        )
+
     def handle_item_changed(self, item):
         try:
             column = item.column() if item else -1
@@ -2197,6 +2447,24 @@ class EditorPage(QWidget):
             selection.format = underline
             selections.append(selection)
         self.notes.setExtraSelections(selections)
+
+    def fix_notes_wording(self):
+        """Runs the "Fix Wording" cleanup on the Notes box - spelling
+        fixes plus a few common awkward-phrasing patterns, all done
+        locally on this computer."""
+        current = self.notes.toPlainText()
+        if not current.strip():
+            QMessageBox.information(self, "Fix Wording", "Type something in Notes first.")
+            return
+        fixed = smart_cleanup_text(current)
+        if fixed == current:
+            QMessageBox.information(self, "Fix Wording", "Nothing needed fixing.")
+            return
+        self.notes.blockSignals(True)
+        self.notes.setPlainText(fixed)
+        self.notes.blockSignals(False)
+        self.mark_notes_spelling()
+        QMessageBox.information(self, "Fix Wording", "Cleaned up the wording in Notes.")
 
     def mark_item_spelling(self, row, column):
         item = self.items.item(row, column)
