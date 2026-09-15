@@ -72,7 +72,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.21"
+CURRENT_VERSION = "1.0.22"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2542,7 +2542,7 @@ class EditorPage(QWidget):
         <meta charset="UTF-8">
         <style>
             * {{ box-sizing: border-box; }}
-            body {{ font-family: "Segoe UI", Arial, sans-serif; padding: 40px 44px; color: #2b2f33; font-size: 12.5px; }}
+            body {{ font-family: "Segoe UI", Arial, sans-serif; padding: 40px 44px; color: #2b2f33; font-size: 12.5px; position: relative; }}
             .label-caps {{ font-size: 10px; letter-spacing: 1.4px; text-transform: uppercase; color: {BRAND_BLUE}; font-weight: 700; margin-bottom: 7px; }}
             .header-row {{ display: table; width: 100%; margin-bottom: 8px; }}
             .header-left {{ display: table-cell; width: 42%; vertical-align: top; }}
@@ -2581,12 +2581,11 @@ class EditorPage(QWidget):
             .total-final span {{ display: table-cell; }}
             .total-final span:last-child {{ text-align: right; }}
             .footer {{ margin-top: 44px; padding-top: 16px; border-top: 1px solid #eef0f3; text-align: center; font-size: 10.5px; color: #9aa1a9; line-height: 1.7; }}
-            .watermark-wrap {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: table; z-index: 0; }}
-            .watermark {{ display: table-cell; vertical-align: middle; text-align: center; white-space: nowrap; font-size: 110px; font-weight: 800; letter-spacing: 6px; color: {BRAND_BLUE}; opacity: 0.08; }}
+            .watermark {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-30deg); text-align: center; white-space: nowrap; font-size: 110px; font-weight: 800; letter-spacing: 6px; color: {BRAND_BLUE}; opacity: 0.08; z-index: 0; }}
         </style>
         </head>
         <body>
-            {'<div class="watermark-wrap"><div class="watermark">ESTIMATE</div></div>' if self.document_type == "estimate" else ""}
+            {'<div class="watermark">ESTIMATE</div>' if self.document_type == "estimate" else ""}
             <div class="header-row">
                 <div class="header-left">
                     {logo_html}
