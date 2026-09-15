@@ -57,6 +57,8 @@ BASE_DIR = getattr(sys, "_MEIPASS", APP_DIR)
 LOGO_FILENAME = "logo_grayblue_transparent.png"
 LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME)
 WRITABLE_LOGO_PATH = os.path.join(APP_DIR, LOGO_FILENAME)
+WATERMARK_FILENAME = "watermark_estimate.png"
+WATERMARK_PATH = os.path.join(BASE_DIR, WATERMARK_FILENAME)
 INVOICE_COUNTER_FILE = os.path.join(APP_DIR, "invoice_counter.txt")
 ESTIMATE_COUNTER_FILE = os.path.join(APP_DIR, "estimate_counter.txt")
 PAST_INVOICE_COUNTER_FILE = os.path.join(APP_DIR, "past_invoice_counter.txt")
@@ -72,7 +74,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.22"
+CURRENT_VERSION = "1.0.23"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2469,6 +2471,23 @@ class EditorPage(QWidget):
         else:
             logo_html = '<div style="font-size:15px; font-weight:700; color:#22394a; letter-spacing:0.5px;">ADAEL<br>CONSTRUCTION</div>'
 
+        # The diagonal "ESTIMATE" watermark is a pre-rendered image (baked-in
+        # rotation and transparency) rather than rotated/centered with CSS -
+        # wkhtmltopdf's rendering engine doesn't reliably support CSS
+        # transforms, which is what made earlier attempts show up
+        # off-center and unrotated. A plain image with a fixed pixel size,
+        # centered with negative margins, doesn't depend on transforms at
+        # all so it renders the same every time.
+        watermark_html = ""
+        if self.document_type == "estimate" and os.path.exists(WATERMARK_PATH):
+            watermark_pixmap = QPixmap(WATERMARK_PATH)
+            watermark_w, watermark_h = watermark_pixmap.width(), watermark_pixmap.height()
+            watermark_html = (
+                f'<img class="watermark-img" src="{image_to_data_uri(WATERMARK_PATH)}" '
+                f'style="width:{watermark_w}px; height:{watermark_h}px; '
+                f'margin-top:-{watermark_h // 2}px; margin-left:-{watermark_w // 2}px;">'
+            )
+
         rows = ""
         for index, item in enumerate(data["items"], start=1):
             qty = clean_float(item.get("qty", "")) or (1 if clean_float(item.get("price", "")) else 0)
@@ -2581,11 +2600,11 @@ class EditorPage(QWidget):
             .total-final span {{ display: table-cell; }}
             .total-final span:last-child {{ text-align: right; }}
             .footer {{ margin-top: 44px; padding-top: 16px; border-top: 1px solid #eef0f3; text-align: center; font-size: 10.5px; color: #9aa1a9; line-height: 1.7; }}
-            .watermark {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-30deg); text-align: center; white-space: nowrap; font-size: 110px; font-weight: 800; letter-spacing: 6px; color: {BRAND_BLUE}; opacity: 0.08; z-index: 0; }}
+            .watermark-img {{ position: absolute; top: 50%; left: 50%; z-index: 0; }}
         </style>
         </head>
         <body>
-            {'<div class="watermark">ESTIMATE</div>' if self.document_type == "estimate" else ""}
+            {watermark_html}
             <div class="header-row">
                 <div class="header-left">
                     {logo_html}
