@@ -17,7 +17,7 @@ from datetime import datetime
 
 import certifi
 import pdfkit
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QEvent, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QStyledItemDelegate,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -74,7 +75,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.23"
+CURRENT_VERSION = "1.0.24"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -1786,6 +1787,46 @@ class HomePage(QWidget):
         self.window.open_editor("invoice", new_invoice)
 
 
+class DescriptionItemDelegate(QStyledItemDelegate):
+    """Lets the Description box on a line item become a real multi-line
+    box instead of one endless line that just keeps scrolling sideways
+    and hiding what was already typed. Pressing Enter here starts a new
+    line, the same as it already works in the Notes box - it doesn't
+    change anything about how the PDF prints, since the PDF already
+    turns each line break into its own line."""
+
+    def createEditor(self, parent, option, index):
+        editor = QTextEdit(parent)
+        editor.setAcceptRichText(False)
+        return editor
+
+    def setEditorData(self, editor, index):
+        editor.setPlainText(index.model().data(index, Qt.EditRole) or "")
+        cursor = editor.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        editor.setTextCursor(cursor)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.toPlainText(), Qt.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index):
+        rect = option.rect
+        rect.setHeight(max(rect.height(), 90))
+        editor.setGeometry(rect)
+
+    def eventFilter(self, editor, event):
+        if (
+            isinstance(editor, QTextEdit)
+            and event.type() == QEvent.KeyPress
+            and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+        ):
+            # Without this, Qt's default table-cell behavior treats Enter
+            # as "done editing" and closes the box - here it should just
+            # start a new line instead, like it does everywhere else.
+            return False
+        return super().eventFilter(editor, event)
+
+
 class EditorPage(QWidget):
     def __init__(self, window):
         super().__init__()
@@ -1893,6 +1934,8 @@ class EditorPage(QWidget):
         self.items.horizontalHeader().setMinimumHeight(38)
         for column in [2, 3, 4]:
             self.items.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.items.setWordWrap(True)
+        self.items.setItemDelegateForColumn(1, DescriptionItemDelegate(self.items))
         self.items.itemChanged.connect(self.handle_item_changed)
         layout.addWidget(self.items, 1)
 
@@ -2086,6 +2129,7 @@ class EditorPage(QWidget):
             if column == 4:
                 table_item.setFlags(table_item.flags() & ~Qt.ItemIsEditable)
             self.items.setItem(row, column, table_item)
+        self.items.resizeRowToContents(row)
         self.mark_item_spelling(row, 0)
         self.mark_item_spelling(row, 1)
         if not block:
@@ -2130,6 +2174,8 @@ class EditorPage(QWidget):
         self.recalculate()
         if column in (0, 1):
             self.mark_item_spelling(row, column)
+        if row >= 0:
+            self.items.resizeRowToContents(row)
 
     def update_spelling_marks(self):
         self.mark_notes_spelling()
