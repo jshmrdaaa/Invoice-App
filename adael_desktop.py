@@ -79,7 +79,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.29"
+CURRENT_VERSION = "1.0.30"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -408,19 +408,44 @@ def send_email_with_attachment(from_email, app_password, to_email, subject, body
                 subtype="pdf",
                 filename=os.path.basename(attachment_path),
             )
-    try:
+    def attempt_ssl():
         with smtplib.SMTP_SSL("smtp.mail.yahoo.com", 465, context=https_context(), timeout=20) as server:
             server.login(from_email, app_password)
             server.send_message(message)
-        return True, None
-    except smtplib.SMTPAuthenticationError:
-        return False, (
-            "Yahoo rejected the email/app password saved in Settings.\n\n"
-            "Generate a fresh app password from Yahoo Account Security, "
-            "paste it into Settings, then try again."
-        )
-    except Exception as error:
-        return False, f"{type(error).__name__}: {error}"
+
+    def attempt_starttls():
+        with smtplib.SMTP("smtp.mail.yahoo.com", 587, timeout=20) as server:
+            server.starttls(context=https_context())
+            server.login(from_email, app_password)
+            server.send_message(message)
+
+    last_error = None
+    # Some networks/security software block a direct SSL connection on
+    # port 465 outright (the connection just gets cut, not rejected with a
+    # real error) but allow the alternate port-587-then-upgrade-to-TLS
+    # method just fine, so if the first way fails for a connection reason
+    # (not a wrong-password reason), it automatically tries the other way
+    # before giving up.
+    for attempt in (attempt_ssl, attempt_starttls):
+        try:
+            attempt()
+            return True, None
+        except smtplib.SMTPAuthenticationError:
+            return False, (
+                "Yahoo rejected the email/app password saved in Settings.\n\n"
+                "Generate a fresh app password from Yahoo Account Security, "
+                "paste it into Settings, then try again."
+            )
+        except Exception as error:
+            last_error = error
+            continue
+
+    return False, (
+        f"Couldn't reach Yahoo's mail server ({type(last_error).__name__}: {last_error}).\n\n"
+        "This usually means a firewall or antivirus on this computer is blocking the "
+        "connection, or this network doesn't allow it. Try a different network "
+        "(like a phone hotspot) or check the antivirus/firewall settings, then try again."
+    )
 
 
 def offer_email_document(parent, document_type, record, pdf_path=""):
