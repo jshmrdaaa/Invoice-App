@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import shutil
+import smtplib
 import ssl
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
+from email.message import EmailMessage
 
 import certifi
 import pdfkit
@@ -77,7 +79,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.28"
+CURRENT_VERSION = "1.0.29"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -89,6 +91,7 @@ DEFAULT_SETTINGS = {
     "owner_name": "Angel Chabla",
     "phone": "(203)-942-6042",
     "email": "acchabla@yahoo.com",
+    "email_app_password": "",
     "address": "",
     "default_notes": "Thank you for your business!",
 }
@@ -382,16 +385,73 @@ def friendly_payment_status(status):
     }.get(status, status)
 
 
-def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_now=True):
+def send_email_with_attachment(from_email, app_password, to_email, subject, body, attachment_path=None):
+    """Sends an email straight from Adael's Yahoo account over Yahoo's mail
+    server - no browser, nothing to drag in by hand. Needs a Yahoo "app
+    password" (set up once in Settings) rather than the real account
+    password, since Yahoo blocks regular sign-ins from apps like this one.
+    Returns (True, None) on success, or (False, a plain-English reason) on
+    failure, so the caller can just show that reason without needing to
+    know anything about email or SMTP."""
+    if not from_email or not app_password:
+        return False, "No Yahoo email/app password is set up yet. Add one in Settings first."
+    message = EmailMessage()
+    message["From"] = from_email
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+    if attachment_path and os.path.exists(attachment_path):
+        with open(attachment_path, "rb") as file:
+            message.add_attachment(
+                file.read(),
+                maintype="application",
+                subtype="pdf",
+                filename=os.path.basename(attachment_path),
+            )
+    try:
+        with smtplib.SMTP_SSL("smtp.mail.yahoo.com", 465, context=https_context(), timeout=20) as server:
+            server.login(from_email, app_password)
+            server.send_message(message)
+        return True, None
+    except smtplib.SMTPAuthenticationError:
+        return False, (
+            "Yahoo rejected the email/app password saved in Settings.\n\n"
+            "Generate a fresh app password from Yahoo Account Security, "
+            "paste it into Settings, then try again."
+        )
+    except Exception as error:
+        return False, f"{type(error).__name__}: {error}"
+
+
+def offer_email_document(parent, document_type, record, pdf_path=""):
     """Shared 'email this to the customer' flow used both right after
     generating a PDF and from the saved Invoices/Estimates lists on the
-    Home screen. Opens the customer's Yahoo Mail compose window pre-filled
-    with a subject and message - Yahoo Mail's compose link can't attach
-    files itself, so the PDF is opened on this computer first to make it
-    quick to drag into the email. Returns True if an email was sent off to
-    be composed, False if it stopped early (no email on file, or the user
-    backed out)."""
-    email_raw = (record.get("customer_email_small") or "").strip()
+    Home screen. Sends the email directly from Adael's Yahoo account with
+    the PDF attached - nothing to open, drag, or attach by hand. Returns
+    True if the email was actually sent, False if it stopped early (not
+    set up yet, no PDF, or the user backed out)."""
+    settings = get_settings()
+    from_email = settings.get("email", "").strip()
+    app_password = settings.get("email_app_password", "").strip()
+    if not app_password:
+        QMessageBox.information(
+            parent,
+            "Email Not Set Up Yet",
+            "To send emails straight from here (with the PDF attached automatically), "
+            "add a Yahoo app password in Settings first - there are instructions "
+            "right above that box.",
+        )
+        return False
+
+    has_pdf = bool(pdf_path) and os.path.exists(pdf_path)
+    if not has_pdf:
+        QMessageBox.warning(
+            parent,
+            "No PDF Found",
+            "Couldn't find a saved PDF for this one - open or generate its PDF first, then try sending.",
+        )
+        return False
+
     doc_label = "Estimate" if document_type == "estimate" else "Invoice"
     doc_num = record.get("invoice_number", "")
     total = money(record.get("total", 0))
@@ -399,8 +459,6 @@ def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_no
     project_line = f" – {project}" if project else ""
     customer = (record.get("customer_name_big") or "").strip()
     greeting = f"Hi {customer}, your" if customer else "Your"
-
-    settings = get_settings()
     company = settings.get("company_name", "Adael Construction LLC")
     msg_body = (
         f"{greeting} {doc_label} #{doc_num}{project_line} "
@@ -408,36 +466,40 @@ def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_no
         f"Please reach out with any questions."
     )
 
-    has_pdf = bool(pdf_path) and os.path.exists(pdf_path)
-    attach_note = (
-        "(The PDF will open on this computer — attach it to the email before sending.)"
-        if has_pdf else
-        "(No saved PDF was found for this one — open or generate its PDF first if you want to attach it.)"
-    )
-    to_line = f" to {email_raw}" if email_raw else " - no email is saved for this customer, so you'll type or paste one in once Yahoo Mail opens"
+    to_email = (record.get("customer_email_small") or "").strip()
+    if not to_email:
+        typed, ok = QInputDialog.getText(
+            parent,
+            "Customer Email",
+            "No email is saved for this customer - enter one to send this to:",
+        )
+        to_email = typed.strip()
+        if not ok or not to_email:
+            return False
+
+    # Open the exact PDF that's about to be attached so it can be looked
+    # over before anything actually sends - not just trusted from a text
+    # summary in this dialog.
+    QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
     answer = QMessageBox.question(
         parent,
         f"Send {doc_label}",
-        f"Open Yahoo Mail to email this {doc_label.lower()}{to_line}?\n\n"
-        f"Message preview:\n{msg_body}\n\n{attach_note}",
+        f"The PDF just opened on this computer — take a look, then come back here.\n\n"
+        f"Email this {doc_label.lower()} to {to_email} with that PDF attached?\n\n"
+        f"From: {from_email}\nMessage preview:\n{msg_body}",
         QMessageBox.Yes | QMessageBox.No,
         QMessageBox.Yes,
     )
     if answer != QMessageBox.Yes:
         return False
-    if has_pdf and open_pdf_now:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
-    subject = urllib.parse.quote(f"{doc_label} #{doc_num} from {company}")
-    email_body = urllib.parse.quote(msg_body)
-    # Yahoo's compose page doesn't reliably decode a percent-encoded "@"
-    # back to a real "@" in the To field, so it shows up looking like
-    # "name%40domain.com" and gets flagged as not a real address. Leaving
-    # "@" (and "." - never encoded anyway) untouched avoids that.
-    to_param = f"to={urllib.parse.quote(email_raw, safe='@')}&" if email_raw else ""
-    QDesktopServices.openUrl(QUrl(
-        f"https://compose.mail.yahoo.com/?{to_param}subject={subject}&body={email_body}"
-    ))
-    return True
+
+    subject = f"{doc_label} #{doc_num} from {company}"
+    success, error_message = send_email_with_attachment(from_email, app_password, to_email, subject, msg_body, pdf_path)
+    if success:
+        QMessageBox.information(parent, "Email Sent", f"Sent to {to_email} with the PDF attached.")
+    else:
+        QMessageBox.critical(parent, "Email Not Sent", f"Could not send the email.\n\n{error_message}")
+    return success
 
 
 def invoice_paid_total(record):
@@ -1195,6 +1257,9 @@ class HomePage(QWidget):
         self.owner_name = QLineEdit()
         self.company_phone = QLineEdit()
         self.company_email = QLineEdit()
+        self.email_app_password = QLineEdit()
+        self.email_app_password.setEchoMode(QLineEdit.Password)
+        self.email_app_password.setPlaceholderText("Yahoo app password (not your regular password)")
         self.company_address = QLineEdit()
         self.default_notes = QTextEdit()
         self.default_notes.setMinimumHeight(90)
@@ -1202,6 +1267,15 @@ class HomePage(QWidget):
         settings_form.addRow("Owner / Contact", self.owner_name)
         settings_form.addRow("Phone", self.company_phone)
         settings_form.addRow("Email", self.company_email)
+        settings_form.addRow("Yahoo App Password", self.email_app_password)
+        app_password_help = QLabel(
+            "Needed so \"Email Invoice\"/\"Email Estimate\" can send with the PDF attached automatically. "
+            "In a browser, sign in to Yahoo → Account Info → Account Security → Generate app password → "
+            "name it \"Adael Invoices\" → paste the password it gives you here (not your normal Yahoo password)."
+        )
+        app_password_help.setWordWrap(True)
+        app_password_help.setObjectName("mutedText")
+        settings_form.addRow("", app_password_help)
         settings_form.addRow("Address", self.company_address)
         settings_form.addRow("Default Notes", self.default_notes)
         for field in (self.company_name, self.owner_name, self.company_address):
@@ -1701,6 +1775,7 @@ class HomePage(QWidget):
         self.owner_name.setText(settings["owner_name"])
         self.company_phone.setText(settings["phone"])
         self.company_email.setText(settings["email"])
+        self.email_app_password.setText(settings.get("email_app_password", ""))
         self.company_address.setText(settings["address"])
         self.default_notes.setPlainText(settings["default_notes"])
 
@@ -1710,6 +1785,7 @@ class HomePage(QWidget):
             "owner_name": self.owner_name.text().strip(),
             "phone": self.company_phone.text().strip(),
             "email": self.company_email.text().strip(),
+            "email_app_password": self.email_app_password.text().strip(),
             "address": self.company_address.text().strip(),
             "default_notes": self.default_notes.toPlainText().strip(),
         }
@@ -1938,7 +2014,7 @@ class HomePage(QWidget):
         if not record:
             QMessageBox.information(self, "Email", f"Select a saved {document_type} first.")
             return
-        offer_email_document(self, document_type, record, pdf_path=record.get("pdf_path", ""), open_pdf_now=True)
+        offer_email_document(self, document_type, record, pdf_path=record.get("pdf_path", ""))
 
     def delete_history_record(self, document_type):
         record = self.selected_history_record(document_type)
@@ -2723,11 +2799,7 @@ class EditorPage(QWidget):
             )
 
     def _offer_send(self, data, pdf_path):
-        # The PDF was already opened on this computer right before this is
-        # called, so open_pdf_now=False avoids popping it open a second time.
-        # pdf_path still gets passed through so the confirmation dialog
-        # correctly knows a PDF exists, instead of claiming there isn't one.
-        offer_email_document(self, self.document_type, data, pdf_path=pdf_path, open_pdf_now=False)
+        offer_email_document(self, self.document_type, data, pdf_path=pdf_path)
 
     def save_customer(self, data):
         name = data["customer_name_big"].strip()
