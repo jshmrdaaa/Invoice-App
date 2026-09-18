@@ -77,7 +77,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.27"
+CURRENT_VERSION = "1.0.28"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -429,7 +429,11 @@ def offer_email_document(parent, document_type, record, pdf_path="", open_pdf_no
         QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
     subject = urllib.parse.quote(f"{doc_label} #{doc_num} from {company}")
     email_body = urllib.parse.quote(msg_body)
-    to_param = f"to={urllib.parse.quote(email_raw)}&" if email_raw else ""
+    # Yahoo's compose page doesn't reliably decode a percent-encoded "@"
+    # back to a real "@" in the To field, so it shows up looking like
+    # "name%40domain.com" and gets flagged as not a real address. Leaving
+    # "@" (and "." - never encoded anyway) untouched avoids that.
+    to_param = f"to={urllib.parse.quote(email_raw, safe='@')}&" if email_raw else ""
     QDesktopServices.openUrl(QUrl(
         f"https://compose.mail.yahoo.com/?{to_param}subject={subject}&body={email_body}"
     ))
