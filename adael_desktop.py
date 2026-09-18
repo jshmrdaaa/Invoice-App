@@ -77,7 +77,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.26"
+CURRENT_VERSION = "1.0.27"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2705,7 +2705,7 @@ class EditorPage(QWidget):
             self.clear_current_draft(data["draft_id"])
             QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
             QMessageBox.information(self, "PDF Created", f"Saved and opened PDF:\n{pdf_path}")
-            self._offer_send(data)
+            self._offer_send(data, pdf_path)
             self.window.show_home()
         except Exception as error:
             QMessageBox.critical(
@@ -2718,10 +2718,12 @@ class EditorPage(QWidget):
                 f"Details: {error}"
             )
 
-    def _offer_send(self, data):
+    def _offer_send(self, data, pdf_path):
         # The PDF was already opened on this computer right before this is
         # called, so open_pdf_now=False avoids popping it open a second time.
-        offer_email_document(self, self.document_type, data, open_pdf_now=False)
+        # pdf_path still gets passed through so the confirmation dialog
+        # correctly knows a PDF exists, instead of claiming there isn't one.
+        offer_email_document(self, self.document_type, data, pdf_path=pdf_path, open_pdf_now=False)
 
     def save_customer(self, data):
         name = data["customer_name_big"].strip()
