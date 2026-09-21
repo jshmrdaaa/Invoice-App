@@ -79,7 +79,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.30"
+CURRENT_VERSION = "1.0.31"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2932,9 +2932,19 @@ class EditorPage(QWidget):
             if discount_amount else ""
         )
 
-        # Amount Paid / Other Charges / Balance Due / Subtotal are for Thiago's
-        # dad's own tracking inside the app only -- intentionally left off the
-        # printed PDF so customers only ever see the Discount (if any) and Total.
+        # Other Charges / Subtotal are for Thiago's dad's own tracking inside
+        # the app only -- left off the printed PDF. Amount Paid / Balance Due
+        # DO print on invoices, but only once a payment exists - a brand new,
+        # nothing-paid-yet invoice just shows the Total like before.
+        payment_summary_html = ""
+        if self.document_type == "invoice":
+            paid_amount = clean_float(data.get("amount_paid", 0))
+            if paid_amount > 0:
+                balance_amount = round(max(clean_float(data["total"]) - paid_amount, 0), 2)
+                payment_summary_html = (
+                    f'<div class="totals-line"><span>Amount Paid</span><span>-{money(paid_amount)}</span></div>'
+                    f'<div class="balance-final"><span>Balance Due</span><span>{money(balance_amount)}</span></div>'
+                )
 
         project_row = ""
         if data.get("project_name", "").strip():
@@ -3010,6 +3020,9 @@ class EditorPage(QWidget):
             .total-final {{ display: table; width: 100%; margin-top: 10px; padding: 10px 12px; background: {BRAND_BLUE}; border-radius: 4px; font-size: 15px; font-weight: 700; color: #ffffff; }}
             .total-final span {{ display: table-cell; }}
             .total-final span:last-child {{ text-align: right; }}
+            .balance-final {{ display: table; width: 100%; margin-top: 8px; padding: 10px 12px; background: #eaf2f8; border: 1px solid {BRAND_BLUE}; border-radius: 4px; font-size: 15px; font-weight: 700; color: {BRAND_BLUE}; }}
+            .balance-final span {{ display: table-cell; }}
+            .balance-final span:last-child {{ text-align: right; }}
             .footer {{ margin-top: 44px; padding-top: 16px; border-top: 1px solid #eef0f3; text-align: center; font-size: 10.5px; color: #9aa1a9; line-height: 1.7; }}
             .watermark-img {{ position: absolute; top: 50%; left: 50%; z-index: 0; }}
         </style>
@@ -3047,6 +3060,7 @@ class EditorPage(QWidget):
                 <div class="totals-cell">
                     {discount_html}
                     <div class="total-final"><span>Total</span><span>{money(data["total"])}</span></div>
+                    {payment_summary_html}
                 </div>
             </div>
             <div class="footer">{footer_html}</div>
