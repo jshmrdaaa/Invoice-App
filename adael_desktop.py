@@ -82,7 +82,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.32"
+CURRENT_VERSION = "1.0.33"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -2610,7 +2610,7 @@ class EditorPage(QWidget):
         )
         can_add_payment = document_type == "invoice" and loaded_history and self.loaded_status != "VOID"
         self.add_payment_button.setVisible(can_add_payment)
-        self.save_button.setText("Save Changes" if loaded_history else "Save Draft")
+        self.save_button.setText("Save")
         self.convert_button.setVisible(document_type == "estimate")
         if document_type == "invoice" and self.current_payments:
             paid_total = round(sum(clean_float(p.get("amount")) for p in self.current_payments), 2)
@@ -2969,18 +2969,42 @@ class EditorPage(QWidget):
         recorded payments, and without the "want to send it?" prompt that
         Generate PDF shows."""
         if not self.loaded_history:
+            # First save of a new document (including a freshly converted
+            # estimate): store it in the Saved Invoices/Estimates list right
+            # away, with no PDF yet. Generate PDF later fills in the PDF for
+            # this same entry. From here on it behaves like any saved record.
             data = self.document_data()
             if not self.has_content(data):
                 QMessageBox.information(self, "Nothing to Save", "Add some details first, then save.")
                 return
-            data["updated_at"] = datetime.today().strftime("%Y/%m/%d %H:%M:%S")
-            drafts = [draft for draft in read_json(DRAFTS_FILE, []) if draft.get("draft_id") != data["draft_id"]]
-            drafts.append(data)
-            write_json(DRAFTS_FILE, sorted(drafts, key=lambda draft: draft.get("updated_at", ""), reverse=True))
-            QMessageBox.information(self, "Draft Saved", "Saved. Pick this back up anytime from the Home screen.")
+            self.loaded_pdf_path = ""
+            self.loaded_pdf_name = ""
+            self.loaded_saved_at = datetime.today().strftime("%Y/%m/%d %H:%M:%S")
+            self.loaded_status = ""
+            self.loaded_history = True
+            self.save_button.setText("Save")
+            self.add_payment_button.setVisible(self.document_type == "invoice")
+            self.clear_current_draft(data["draft_id"])
+            self._store_saved_record(data)
+            QMessageBox.information(
+                self, "Saved",
+                f"Saved to your {self.document_type} list. No PDF has been made yet - "
+                "press Generate when you're ready.",
+            )
             return
 
-        data = self.document_data()
+        self._store_saved_record(self.document_data())
+        QMessageBox.information(
+            self,
+            "Changes Saved",
+            "Changes saved.\n\nThe existing PDF file wasn't touched — use \"Generate PDF\" "
+            "if you need a fresh PDF that includes these changes.",
+        )
+
+    def _store_saved_record(self, data):
+        """Writes the current screen into the saved Invoices/Estimates list
+        (replacing any entry with the same number), keeping the existing
+        PDF details and recorded payments untouched."""
         data["pdf_path"] = self.loaded_pdf_path
         data["pdf_name"] = self.loaded_pdf_name
         data["saved_at"] = self.loaded_saved_at or datetime.today().strftime("%Y/%m/%d %H:%M:%S")
@@ -2998,12 +3022,6 @@ class EditorPage(QWidget):
         write_json(history_file, sorted(history, key=document_sort_key, reverse=True))
         self.save_customer(data)
         self.loaded_status = data["status"]
-        QMessageBox.information(
-            self,
-            "Changes Saved",
-            "Changes saved.\n\nThe existing PDF file wasn't touched — use \"Generate PDF\" "
-            "if you need a fresh PDF that includes these changes.",
-        )
 
     def convert_to_invoice(self):
         """Turns the estimate currently open in the editor into a brand-new
