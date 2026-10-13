@@ -1,4 +1,5 @@
 import base64
+import copy
 import html
 import json
 import mimetypes
@@ -9,6 +10,7 @@ import smtplib
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -19,12 +21,13 @@ from email.message import EmailMessage
 
 import certifi
 import pdfkit
-from PySide6.QtCore import Qt, QEvent, QUrl
+from PySide6.QtCore import Qt, QEvent, QEventLoop, QProcess, QSize, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -79,7 +82,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.31"
+CURRENT_VERSION = "1.0.32"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -130,20 +133,59 @@ COMMON_TEXT_FIXES = {
 }
 
 
+def _read_json_once(path):
+    with open(path, "r") as file:
+        return json.load(file)
+
+
 def read_json(path, fallback):
-    if not os.path.exists(path):
-        return fallback
-    try:
-        with open(path, "r") as file:
-            return json.load(file)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return fallback
+    """Reads a saved data file. If the file is briefly locked (OneDrive
+    syncing, antivirus scanning) it retries a few times instead of treating
+    that as "empty" - treating a locked file as empty is what used to let
+    the next save overwrite everything with just the one new record. If
+    the file is genuinely damaged it falls back to the automatic .bak copy
+    kept from the last good save."""
+    candidates = [path, path + ".bak"]
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        for attempt in range(4):
+            try:
+                return _read_json_once(candidate)
+            except (json.JSONDecodeError, ValueError):
+                break  # damaged file - retrying won't help, try the .bak copy
+            except OSError:
+                time.sleep(0.25)  # locked for a moment - try again
+    return fallback
 
 
 def write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as file:
+    """Saves safely: writes to a temporary file first and only swaps it
+    into place once it's completely written, keeping the previous version
+    as a .bak. A freeze, crash, or power loss in the middle of a save can
+    no longer leave a half-written (and therefore unreadable) file behind.
+    Retries briefly if OneDrive/antivirus has the file locked."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    temp_path = path + ".tmp"
+    with open(temp_path, "w") as file:
         json.dump(data, file, indent=4)
+        file.flush()
+        os.fsync(file.fileno())
+    last_error = None
+    for attempt in range(8):
+        try:
+            if os.path.exists(path):
+                try:
+                    shutil.copyfile(path, path + ".bak")
+                except OSError:
+                    pass
+            os.replace(temp_path, path)
+            return
+        except OSError as error:
+            last_error = error
+            time.sleep(0.3)
+    raise last_error
 
 
 def backup_file_list():
@@ -354,6 +396,176 @@ def pdfkit_config():
     if on_path:
         return pdfkit.configuration(wkhtmltopdf=on_path)
     return None
+
+
+class PdfOpenElsewhereError(Exception):
+    pass
+
+
+class _BusyDialog(QDialog):
+    """Small 'please wait' box shown while a PDF is being built. It blocks
+    clicks on the rest of the app (so nothing gets pressed twice) but the
+    app itself keeps running normally behind it."""
+
+    def __init__(self, message):
+        super().__init__(QApplication.activeWindow())
+        self.setWindowTitle("Please wait")
+        self.setModal(True)
+        self.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        layout = QVBoxLayout(self)
+        label = QLabel(message)
+        label.setStyleSheet("font-size: 16px; padding: 18px 28px;")
+        layout.addWidget(label)
+
+    def reject(self):
+        pass
+
+
+def render_pdf(html_text, path, timeout=90):
+    """Turns the page into a PDF without ever freezing the window. The
+    converter runs as a background process while the app's normal event
+    loop keeps running (so Windows never marks the app "Not Responding"),
+    it's cut off after `timeout` seconds instead of hanging forever, and
+    it writes to a temporary file first so a half-finished PDF never
+    replaces a good one. If that document's PDF is open in a viewer
+    (Windows won't let it be replaced), a clear message is raised."""
+    config = pdfkit_config()
+    if config is None:
+        raise FileNotFoundError("No wkhtmltopdf executable found")
+    temp_pdf = path + ".building.pdf"
+    temp_html = path + ".building.html"
+    for stale in (temp_pdf, temp_html):
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+    with open(temp_html, "w", encoding="utf-8") as html_file:
+        html_file.write(html_text)
+
+    arguments = [
+        "--quiet", "--enable-local-file-access", "--disable-javascript",
+        "--encoding", "utf-8",
+        "--load-error-handling", "ignore", "--load-media-error-handling", "ignore",
+        temp_html, temp_pdf,
+    ]
+    process = QProcess()
+    process.setProcessChannelMode(QProcess.MergedChannels)
+    loop = QEventLoop()
+    state = {"timed_out": False}
+
+    def on_timeout():
+        state["timed_out"] = True
+        process.kill()
+        loop.quit()
+
+    timer = QTimer()
+    timer.setSingleShot(True)
+    timer.timeout.connect(on_timeout)
+    process.finished.connect(lambda *_: loop.quit())
+    process.errorOccurred.connect(lambda *_: loop.quit())
+
+    dialog = _BusyDialog("Creating your PDF...")
+    dialog.show()
+    QApplication.processEvents()
+    try:
+        process.start(config.wkhtmltopdf, arguments)
+        timer.start(int(timeout * 1000))
+        if process.state() != QProcess.NotRunning:
+            loop.exec()
+        timer.stop()
+        if process.state() != QProcess.NotRunning:
+            process.kill()
+            process.waitForFinished(3000)
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        try:
+            os.remove(temp_html)
+        except OSError:
+            pass
+
+    output = bytes(process.readAll()).decode("utf-8", "ignore").strip()
+    if state["timed_out"]:
+        raise TimeoutError(f"The PDF took longer than {timeout} seconds to build and was stopped.")
+    if process.error() == QProcess.FailedToStart:
+        raise FileNotFoundError(f"No wkhtmltopdf executable found ({process.errorString()})")
+    if not (os.path.exists(temp_pdf) and os.path.getsize(temp_pdf) > 0):
+        raise RuntimeError(output or "wkhtmltopdf produced no file")
+    try:
+        os.replace(temp_pdf, path)
+    except OSError:
+        raise PdfOpenElsewhereError(
+            "That document's PDF is open in another program (like a browser or PDF viewer). "
+            "Close it, then try again."
+        )
+
+
+def print_pdf_file(parent, pdf_path):
+    """Opens the normal Windows print window for a PDF and prints it.
+    Falls back to opening the PDF in the viewer (Ctrl+P there) if the
+    built-in printing pieces aren't available for some reason."""
+    try:
+        from PySide6.QtGui import QPainter
+        from PySide6.QtPdf import QPdfDocument
+        from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+    except Exception as error:
+        log_update_event(f"PRINT unavailable: {error}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
+        QMessageBox.information(
+            parent, "Print",
+            "The PDF was opened. Press Ctrl+P in the PDF window to print it.",
+        )
+        return
+    document = QPdfDocument(parent)
+    document.load(pdf_path)
+    if document.status() != QPdfDocument.Status.Ready or document.pageCount() < 1:
+        QMessageBox.warning(parent, "Print", "That PDF could not be opened for printing.")
+        return
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setResolution(300)
+    dialog = QPrintDialog(printer, parent)
+    dialog.setWindowTitle("Print")
+    if dialog.exec() != QDialog.Accepted:
+        return
+    QApplication.setOverrideCursor(Qt.WaitCursor)
+    try:
+        painter = QPainter(printer)
+        page_rect = printer.pageRect(QPrinter.DevicePixel)
+        for index in range(document.pageCount()):
+            if index > 0:
+                printer.newPage()
+            point_size = document.pagePointSize(index)
+            scale = min(page_rect.width() / point_size.width(), page_rect.height() / point_size.height())
+            size = QSize(max(1, int(point_size.width() * scale)), max(1, int(point_size.height() * scale)))
+            image = document.render(index, size)
+            painter.drawImage(int(page_rect.x()), int(page_rect.y()), image)
+        painter.end()
+    except Exception as error:
+        log_update_event(f"PRINT ERROR - {type(error).__name__}: {error}")
+        QMessageBox.warning(parent, "Print", f"Printing didn't work: {error}")
+    finally:
+        QApplication.restoreOverrideCursor()
+
+
+def invoice_from_estimate(estimate):
+    """Builds the starting data for a brand-new invoice from an estimate
+    (used by both the Home screen button and the editor's Convert button).
+    Copies the customer, items, notes and totals, but starts with a fresh
+    invoice number/date, no payments, and none of the estimate's saved-file
+    details - including its draft id, which would otherwise make the new
+    invoice overwrite the estimate's own draft."""
+    new_invoice = copy.deepcopy(estimate)
+    for key in ("pdf_path", "pdf_name", "status", "draft_id", "saved_at", "updated_at"):
+        new_invoice.pop(key, None)
+    new_invoice["document_type"] = "invoice"
+    new_invoice["invoice_number"] = get_next_number("invoice")
+    increase_number("invoice")
+    new_invoice["invoice_date"] = today_text()
+    new_invoice["amount_paid"] = ""
+    new_invoice["payments"] = []
+    new_invoice["balance_due"] = clean_float(new_invoice.get("total", 0))
+    return new_invoice
 
 
 def payment_status(total, amount_paid):
@@ -734,15 +946,30 @@ def _spelling_suggestions(word, dictionary, try_harder=False):
     one-letter-edits so it's never slow enough to notice."""
     if not word or _word_known(word, dictionary):
         return []
+    cache_key = (word, bool(try_harder))
+    cached = _SUGGESTION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     candidates = {edit for edit in _spelling_edits1(word) if _word_known(edit, dictionary)}
-    if not candidates and try_harder and len(word) >= 4:
+    # The two-edit search is thousands of times more work than the one-edit
+    # search, so it's limited to mid-length words - on a long unknown word
+    # (a name, a part number) it could otherwise stall the whole window.
+    if not candidates and try_harder and 4 <= len(word) <= 9:
         candidates = {
             edit2
             for edit1 in _spelling_edits1(word)
             for edit2 in _spelling_edits1(edit1)
             if _word_known(edit2, dictionary)
         }
-    return sorted(candidates, key=lambda candidate: (abs(len(candidate) - len(word)), candidate))
+    result = sorted(candidates, key=lambda candidate: (abs(len(candidate) - len(word)), candidate))
+    if len(_SUGGESTION_CACHE) > 3000:
+        _SUGGESTION_CACHE.clear()
+    _SUGGESTION_CACHE[cache_key] = result
+    return result
+
+
+_SUGGESTION_CACHE = {}
+_TEXT_ISSUES_CACHE = {}
 
 
 def _word_known(word, dictionary):
@@ -813,6 +1040,18 @@ def _dictionary_issues(text, try_harder=False):
 
 def text_issues(value, try_harder=False):
     text = str(value or "")
+    cache_key = (text, bool(try_harder))
+    cached = _TEXT_ISSUES_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    result = _compute_text_issues(text, try_harder)
+    if len(_TEXT_ISSUES_CACHE) > 500:
+        _TEXT_ISSUES_CACHE.clear()
+    _TEXT_ISSUES_CACHE[cache_key] = result
+    return list(result)
+
+
+def _compute_text_issues(text, try_harder=False):
     issues = []
     covered = []
     for wrong, right in COMMON_TEXT_FIXES.items():
@@ -1036,14 +1275,12 @@ class HomePage(QWidget):
         self.all_invoice_history = []
         self.all_estimate_history = []
         self.drafts.setObjectName("panelList")
-        self.drafts.setMinimumHeight(160)
-        self.drafts.setMaximumHeight(280)
+        self.drafts.setMinimumHeight(140)
         self.drafts.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.drafts.setAlternatingRowColors(True)
         for table in [self.invoice_history, self.estimate_history]:
             table.setObjectName("panelList")
-            table.setMinimumHeight(180)
-            table.setMaximumHeight(300)
+            table.setMinimumHeight(140)
             table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             table.setAlternatingRowColors(True)
             table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1212,6 +1449,9 @@ class HomePage(QWidget):
         invoice_saved_actions.addWidget(open_invoice)
         invoice_saved_actions.addWidget(open_invoice_pdf)
         invoice_saved_actions.addWidget(email_invoice)
+        print_invoice = QPushButton("Print Invoice")
+        print_invoice.clicked.connect(lambda: self.print_history_record("invoice"))
+        invoice_saved_actions.addWidget(print_invoice)
         invoice_saved_actions.addStretch(1)
         invoices_layout.addLayout(invoice_saved_actions)
 
@@ -1255,6 +1495,9 @@ class HomePage(QWidget):
         estimate_saved_actions.addWidget(open_estimate)
         estimate_saved_actions.addWidget(open_estimate_pdf)
         estimate_saved_actions.addWidget(email_estimate)
+        print_estimate = QPushButton("Print Estimate")
+        print_estimate.clicked.connect(lambda: self.print_history_record("estimate"))
+        estimate_saved_actions.addWidget(print_estimate)
         estimate_saved_actions.addWidget(make_invoice)
         estimate_saved_actions.addStretch(1)
         estimates_layout.addLayout(estimate_saved_actions)
@@ -2073,18 +2316,18 @@ class HomePage(QWidget):
         estimate = self.selected_item_data(self.estimate_history)
         if not estimate:
             return
-        new_invoice = estimate.copy()
-        new_invoice["document_type"] = "invoice"
-        new_invoice["invoice_number"] = get_next_number("invoice")
-        increase_number("invoice")
-        new_invoice["invoice_date"] = today_text()
-        new_invoice["amount_paid"] = ""
-        new_invoice["payments"] = []
-        new_invoice["balance_due"] = clean_float(new_invoice.get("total", 0))
-        new_invoice.pop("pdf_path", None)
-        new_invoice.pop("pdf_name", None)
-        new_invoice.pop("status", None)
-        self.window.open_editor("invoice", new_invoice)
+        self.window.open_editor("invoice", invoice_from_estimate(estimate))
+
+    def print_history_record(self, document_type):
+        record = self.selected_history_record(document_type)
+        if not record:
+            QMessageBox.information(self, "Print", f"Select a saved {document_type} first.")
+            return
+        pdf_path = record.get("pdf_path", "")
+        if not pdf_path or not os.path.exists(pdf_path):
+            QMessageBox.warning(self, "Print", "That saved PDF could not be found. Open it and press Generate again.")
+            return
+        print_pdf_file(self, pdf_path)
 
 
 class DescriptionItemDelegate(QStyledItemDelegate):
@@ -2307,6 +2550,9 @@ class EditorPage(QWidget):
         self.generate_button.setObjectName("primaryButton")
         self.generate_button.setMinimumHeight(42)
         self.save_button.setMinimumHeight(42)
+        self.print_button = QPushButton("Print")
+        self.print_button.setMinimumHeight(42)
+        self.print_button.clicked.connect(self.print_document)
         self.preview_button.clicked.connect(self.preview_pdf)
         self.generate_button.clicked.connect(self.generate_pdf)
         self.additional.textChanged.connect(self.recalculate)
@@ -2322,6 +2568,7 @@ class EditorPage(QWidget):
         totals_box.addRow(self.save_button)
         totals_box.addRow(self.convert_button)
         totals_box.addRow(self.preview_button)
+        totals_box.addRow(self.print_button)
         totals_box.addRow(self.generate_button)
         totals_widget = QWidget()
         totals_widget.setObjectName("totalsPanel")
@@ -2338,6 +2585,7 @@ class EditorPage(QWidget):
         title = "ESTIMATE" if document_type == "estimate" else "INVOICE"
         self.title.setText(title)
         self.preview_button.setText(f"Preview {title.title()} PDF")
+        self.print_button.setText(f"Print {title.title()}")
         self.generate_button.setText(f"Generate {title.title()} PDF")
         self.amount_paid.setVisible(document_type == "invoice")
         self.current_payments = data.get("payments") or []
@@ -2678,6 +2926,12 @@ class EditorPage(QWidget):
         ])
 
     def save_draft(self):
+        try:
+            self._save_draft_impl()
+        except Exception as error:
+            log_update_event(f"DRAFT SAVE ERROR - {type(error).__name__}: {error}\n{traceback.format_exc()}")
+
+    def _save_draft_impl(self):
         if self.loaded_history:
             return
         data = self.document_data()
@@ -2693,6 +2947,21 @@ class EditorPage(QWidget):
         self.window.show_home()
 
     def save_changes(self):
+        try:
+            self._save_changes_impl()
+        except Exception as error:
+            log_update_event(f"SAVE ERROR - {type(error).__name__}: {error}\n{traceback.format_exc()}")
+            QMessageBox.critical(
+                self,
+                "Couldn't Save",
+                "The save didn't go through, but nothing you typed has been lost - it's still on "
+                "this screen. Wait a few seconds and press Save again.\n\n"
+                "(If this keeps happening, the app's folder may be inside OneDrive, which can "
+                "briefly lock files while it syncs.)\n\n"
+                f"Details: {error}",
+            )
+
+    def _save_changes_impl(self):
         """The plain Save button. For a brand-new/in-progress document this
         just saves a draft. For an already-generated invoice or estimate
         it updates the saved record in place - notes, items, discount,
@@ -2749,19 +3018,7 @@ class EditorPage(QWidget):
             QMessageBox.information(self, "Nothing to Convert", "Add some details first, then convert.")
             return
         self.save_draft()
-        new_invoice = data.copy()
-        new_invoice["document_type"] = "invoice"
-        new_invoice["invoice_number"] = get_next_number("invoice")
-        increase_number("invoice")
-        new_invoice["invoice_date"] = today_text()
-        new_invoice["amount_paid"] = ""
-        new_invoice["payments"] = []
-        new_invoice["balance_due"] = clean_float(new_invoice.get("total", 0))
-        new_invoice.pop("pdf_path", None)
-        new_invoice.pop("pdf_name", None)
-        new_invoice.pop("status", None)
-        new_invoice.pop("draft_id", None)
-        self.window.open_editor("invoice", new_invoice)
+        self.window.open_editor("invoice", invoice_from_estimate(data))
 
     def add_payment(self):
         if self.document_type != "invoice" or not self.loaded_history:
@@ -2791,17 +3048,47 @@ class EditorPage(QWidget):
             pdf_path = self.create_pdf(data, preview=True)
             QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
         except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Preview Error",
-                "The preview PDF could not be created.\n\n"
+            self._show_pdf_error("Preview Error", "The preview PDF could not be created.", error)
+
+    def print_document(self):
+        """Print what's on screen right now - no need to Generate (or save)
+        first. Builds a throwaway copy of the PDF just for printing."""
+        if getattr(self, "_generating", False):
+            return
+        self._generating = True
+        try:
+            data = self.document_data()
+            if not self.has_content(data):
+                QMessageBox.information(self, "Nothing to Print", "Add some details first, then print.")
+                return
+            pdf_path = self.create_pdf(data, preview=True)
+            print_pdf_file(self, pdf_path)
+        except Exception as error:
+            self._show_pdf_error("Print Error", "This couldn't be printed.", error)
+        finally:
+            self._generating = False
+
+    def _show_pdf_error(self, title, headline, error):
+        try:
+            log_update_event(f"{title}: {type(error).__name__}: {error}")
+        except Exception:
+            pass
+        if isinstance(error, FileNotFoundError) and "wkhtmltopdf" in str(error):
+            detail = (
                 "This computer is missing a required program called wkhtmltopdf. "
                 "Download and install it from wkhtmltopdf.org/downloads.html "
-                "(choose the Windows installer), then try again.\n\n"
-                f"Details: {error}"
+                "(choose the Windows installer), then try again."
             )
+        elif isinstance(error, (PdfOpenElsewhereError, TimeoutError)):
+            detail = str(error)
+        else:
+            detail = f"Your information is still on screen - nothing was lost.\n\nDetails: {error}"
+        QMessageBox.critical(self, title, f"{headline}\n\n{detail}")
 
     def generate_pdf(self):
+        if getattr(self, "_generating", False):
+            return
+        self._generating = True
         try:
             data = self.document_data()
             pdf_path = self.create_pdf(data, preview=False)
@@ -2813,15 +3100,9 @@ class EditorPage(QWidget):
             self._offer_send(data, pdf_path)
             self.window.show_home()
         except Exception as error:
-            QMessageBox.critical(
-                self,
-                "PDF Error",
-                "The PDF could not be created.\n\n"
-                "This computer is missing a required program called wkhtmltopdf. "
-                "Download and install it from wkhtmltopdf.org/downloads.html "
-                "(choose the Windows installer), then try again.\n\n"
-                f"Details: {error}"
-            )
+            self._show_pdf_error("PDF Error", "The PDF could not be created.", error)
+        finally:
+            self._generating = False
 
     def _offer_send(self, data, pdf_path):
         offer_email_document(self, self.document_type, data, pdf_path=pdf_path)
@@ -3083,12 +3364,7 @@ class EditorPage(QWidget):
         else:
             filename = f"{folder[:-1]}_{data['invoice_number']}.pdf"
         path = os.path.join(output_dir, filename)
-        config = pdfkit_config()
-        options = {"enable-local-file-access": ""}
-        if config:
-            pdfkit.from_string(pdf_html, path, options=options, configuration=config)
-        else:
-            pdfkit.from_string(pdf_html, path, options=options)
+        render_pdf(pdf_html, path)
         return path
 
 
@@ -3297,7 +3573,18 @@ def run_update_check_if_available(app):
     return True
 
 
+def _log_unhandled_exception(exc_type, exc_value, exc_tb):
+    """Any unexpected error that would otherwise vanish (the app has no
+    console) gets written to update_log.txt so it can be looked at later."""
+    try:
+        details = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log_update_event(f"UNHANDLED ERROR - {details}")
+    except Exception:
+        pass
+
+
 def main():
+    sys.excepthook = _log_unhandled_exception
     app = QApplication(sys.argv)
     if run_update_check_if_available(app):
         sys.exit(0)

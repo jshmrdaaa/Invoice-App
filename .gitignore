@@ -7,6 +7,8 @@ invoice_counter.txt
 estimate_counter.txt
 past_invoice_counter.txt
 update_log.txt
+*.json.bak
+*.json.tmp
 
 # Build output
 build/
