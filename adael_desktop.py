@@ -82,7 +82,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.33"
+CURRENT_VERSION = "1.0.34"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -502,13 +502,15 @@ def render_pdf(html_text, path, timeout=90):
 
 
 def print_pdf_file(parent, pdf_path):
-    """Opens the normal Windows print window for a PDF and prints it.
-    Falls back to opening the PDF in the viewer (Ctrl+P there) if the
-    built-in printing pieces aren't available for some reason."""
+    """Shows an in-app print preview (so it never depends on Windows' own
+    preview, which some printers report as unsupported) and prints from
+    there. Falls back to opening the PDF in the viewer (Ctrl+P there) if
+    the built-in printing pieces aren't available for some reason."""
     try:
+        from PySide6.QtCore import QRectF
         from PySide6.QtGui import QPainter
         from PySide6.QtPdf import QPdfDocument
-        from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+        from PySide6.QtPrintSupport import QPrintPreviewDialog, QPrinter
     except Exception as error:
         log_update_event(f"PRINT unavailable: {error}")
         QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
@@ -522,30 +524,64 @@ def print_pdf_file(parent, pdf_path):
     if document.status() != QPdfDocument.Status.Ready or document.pageCount() < 1:
         QMessageBox.warning(parent, "Print", "That PDF could not be opened for printing.")
         return
-    printer = QPrinter(QPrinter.HighResolution)
-    printer.setResolution(300)
-    dialog = QPrintDialog(printer, parent)
-    dialog.setWindowTitle("Print")
-    if dialog.exec() != QDialog.Accepted:
-        return
-    QApplication.setOverrideCursor(Qt.WaitCursor)
-    try:
+
+    def paint(printer):
         painter = QPainter(printer)
-        page_rect = printer.pageRect(QPrinter.DevicePixel)
-        for index in range(document.pageCount()):
-            if index > 0:
-                printer.newPage()
-            point_size = document.pagePointSize(index)
-            scale = min(page_rect.width() / point_size.width(), page_rect.height() / point_size.height())
-            size = QSize(max(1, int(point_size.width() * scale)), max(1, int(point_size.height() * scale)))
-            image = document.render(index, size)
-            painter.drawImage(int(page_rect.x()), int(page_rect.y()), image)
-        painter.end()
+        try:
+            page_rect = printer.pageRect(QPrinter.DevicePixel)
+            for index in range(document.pageCount()):
+                if index > 0:
+                    printer.newPage()
+                point_size = document.pagePointSize(index)
+                scale = min(page_rect.width() / point_size.width(), page_rect.height() / point_size.height())
+                target = QRectF(
+                    page_rect.x(), page_rect.y(),
+                    point_size.width() * scale, point_size.height() * scale,
+                )
+                # Render at no more than ~300 dpi so big printer
+                # resolutions don't eat memory; Qt scales it to fit.
+                render_scale = min(300 / 72.0, scale)
+                size = QSize(
+                    max(1, int(point_size.width() * render_scale)),
+                    max(1, int(point_size.height() * render_scale)),
+                )
+                painter.drawImage(target, document.render(index, size))
+        finally:
+            painter.end()
+
+    printer = QPrinter(QPrinter.HighResolution)
+    preview = QPrintPreviewDialog(printer, parent)
+    preview.setWindowTitle("Print Preview")
+    preview.resize(900, 750)
+    preview.paintRequested.connect(paint)
+    try:
+        preview.exec()
     except Exception as error:
         log_update_event(f"PRINT ERROR - {type(error).__name__}: {error}")
         QMessageBox.warning(parent, "Print", f"Printing didn't work: {error}")
-    finally:
-        QApplication.restoreOverrideCursor()
+
+
+def mark_estimate_converted(estimate_number, invoice_number):
+    """Remembers on a saved estimate which invoice was made from it, so
+    pressing Convert again can warn instead of quietly making a duplicate."""
+    history = read_json(ESTIMATE_HISTORY_FILE, [])
+    changed = False
+    for record in history:
+        if str(record.get("invoice_number")) == str(estimate_number):
+            record["converted_invoice"] = invoice_number
+            changed = True
+    if changed:
+        write_json(ESTIMATE_HISTORY_FILE, history)
+
+
+def ask_convert_again(parent, already_invoice):
+    answer = QMessageBox.question(
+        parent, "Already Converted",
+        f"This estimate was already turned into Invoice #{already_invoice}.\n\n"
+        "Make another invoice from it anyway?",
+        QMessageBox.No | QMessageBox.Yes, QMessageBox.No,
+    )
+    return answer == QMessageBox.Yes
 
 
 def invoice_from_estimate(estimate):
@@ -556,7 +592,7 @@ def invoice_from_estimate(estimate):
     details - including its draft id, which would otherwise make the new
     invoice overwrite the estimate's own draft."""
     new_invoice = copy.deepcopy(estimate)
-    for key in ("pdf_path", "pdf_name", "status", "draft_id", "saved_at", "updated_at"):
+    for key in ("pdf_path", "pdf_name", "status", "draft_id", "saved_at", "updated_at", "converted_invoice"):
         new_invoice.pop(key, None)
     new_invoice["document_type"] = "invoice"
     new_invoice["invoice_number"] = get_next_number("invoice")
@@ -2316,7 +2352,12 @@ class HomePage(QWidget):
         estimate = self.selected_item_data(self.estimate_history)
         if not estimate:
             return
-        self.window.open_editor("invoice", invoice_from_estimate(estimate))
+        already = estimate.get("converted_invoice")
+        if already and not ask_convert_again(self, already):
+            return
+        new_invoice = invoice_from_estimate(estimate)
+        mark_estimate_converted(estimate.get("invoice_number"), new_invoice["invoice_number"])
+        self.window.open_editor("invoice", new_invoice)
 
     def print_history_record(self, document_type):
         record = self.selected_history_record(document_type)
@@ -2380,6 +2421,8 @@ class EditorPage(QWidget):
         self.current_payments = []
         self.loaded_pdf_path = ""
         self.loaded_pdf_name = ""
+        self.converted_invoice = ""
+        self._saved_snapshot = None
         self.loaded_saved_at = ""
         self.loaded_status = ""
 
@@ -2594,6 +2637,7 @@ class EditorPage(QWidget):
         # them out or triggering a brand-new PDF/history entry.
         self.loaded_pdf_path = data.get("pdf_path", "")
         self.loaded_pdf_name = data.get("pdf_name", "")
+        self.converted_invoice = data.get("converted_invoice", "") if document_type == "estimate" else ""
         self.loaded_saved_at = data.get("saved_at", "")
         self.loaded_status = data.get("status", "")
         # Amount Paid is a running total, not something to type into - the
@@ -2651,6 +2695,10 @@ class EditorPage(QWidget):
         self.items.blockSignals(False)
         self.recalculate()
         self.update_spelling_marks()
+        self._saved_snapshot = self._snapshot() if loaded_history else None
+
+    def _snapshot(self):
+        return json.dumps(self.document_data(), sort_keys=True, default=str)
 
     def refresh_customer_lookup(self):
         current_text = self.customer_lookup.currentText()
@@ -2902,6 +2950,7 @@ class EditorPage(QWidget):
             "subtotal": subtotal,
             "total": total,
             "balance_due": balance,
+            "converted_invoice": self.converted_invoice,
         }
 
     def has_content(self, data):
@@ -2968,6 +3017,12 @@ class EditorPage(QWidget):
         whatever changed - without touching the existing PDF file or
         recorded payments, and without the "want to send it?" prompt that
         Generate PDF shows."""
+        if self._saved_snapshot is not None and self._saved_snapshot == self._snapshot():
+            QMessageBox.information(
+                self, "Already Saved",
+                "This is already saved - nothing has changed since. Make a change to save again.",
+            )
+            return
         if not self.loaded_history:
             # First save of a new document (including a freshly converted
             # estimate): store it in the Saved Invoices/Estimates list right
@@ -2986,6 +3041,7 @@ class EditorPage(QWidget):
             self.add_payment_button.setVisible(self.document_type == "invoice")
             self.clear_current_draft(data["draft_id"])
             self._store_saved_record(data)
+            self._saved_snapshot = self._snapshot()
             QMessageBox.information(
                 self, "Saved",
                 f"Saved to your {self.document_type} list. No PDF has been made yet - "
@@ -2994,6 +3050,7 @@ class EditorPage(QWidget):
             return
 
         self._store_saved_record(self.document_data())
+        self._saved_snapshot = self._snapshot()
         QMessageBox.information(
             self,
             "Changes Saved",
@@ -3035,8 +3092,14 @@ class EditorPage(QWidget):
         if not self.has_content(data):
             QMessageBox.information(self, "Nothing to Convert", "Add some details first, then convert.")
             return
+        if self.converted_invoice and not ask_convert_again(self, self.converted_invoice):
+            return
+        new_invoice = invoice_from_estimate(data)
+        self.converted_invoice = new_invoice["invoice_number"]
+        if self.loaded_history:
+            mark_estimate_converted(data["invoice_number"], self.converted_invoice)
         self.save_draft()
-        self.window.open_editor("invoice", invoice_from_estimate(data))
+        self.window.open_editor("invoice", new_invoice)
 
     def add_payment(self):
         if self.document_type != "invoice" or not self.loaded_history:
