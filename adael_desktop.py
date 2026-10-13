@@ -82,7 +82,7 @@ UPDATE_LOG_FILE = os.path.join(APP_DIR, "update_log.txt")
 # AUTO-UPDATE
 # ============================================================
 # Bump this number every time you build and release a new version.
-CURRENT_VERSION = "1.0.34"
+CURRENT_VERSION = "1.0.35"
 
 # Replace YOUR-GITHUB-USERNAME / YOUR-REPO-NAME with your own once you've
 # created the GitHub repo (see the auto-update setup instructions).
@@ -1332,6 +1332,12 @@ class HomePage(QWidget):
             self.estimate_history.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.invoice_history.itemClicked.connect(self.select_invoice_history)
         self.estimate_history.itemClicked.connect(lambda _item: self.mark_history_selection("estimate"))
+        # Double-click anything in these lists to open it.
+        self.invoice_history.cellDoubleClicked.connect(
+            lambda *_: (self.select_invoice_history(None), self.open_history("invoice")))
+        self.estimate_history.cellDoubleClicked.connect(
+            lambda *_: (self.mark_history_selection("estimate"), self.open_history("estimate")))
+        self.drafts.itemDoubleClicked.connect(lambda _item: self.open_selected_draft())
 
         self.content_stack = QStackedWidget()
         self.nav_list = QListWidget()
